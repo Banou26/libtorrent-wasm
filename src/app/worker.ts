@@ -19,7 +19,7 @@ import * as net from '@webvpn/net'
 import * as dgram from '@webvpn/dgram'
 
 import factory from './libtorrent.js'
-import { OPFSStorage } from '../src/opfs'
+import { OPFSStorage } from '../opfs'
 
 let inst: any
 const rxLog: any[] = []

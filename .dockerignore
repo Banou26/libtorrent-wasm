@@ -4,9 +4,9 @@ dist
 .em_cache
 .playwright-mcp
 .vitest-attachments
-example/node_modules
-example/libtorrent.js
-example/libtorrent.wasm
+src/app/node_modules
+src/app/libtorrent.js
+src/app/libtorrent.wasm
 .git
 .github
 README.md

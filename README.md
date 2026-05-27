@@ -18,7 +18,7 @@ src/           # the WASM port itself
   index.ts           - public JS API (Session)
   opfs.ts            - StorageBackend impl backed by the OPFS
   types.ts           - shared TS types
-example/       # browser harness with diagnostic pages
+src/app/       # browser harness with diagnostic pages
 dist/          # emcc output (gitignored)
 build/         # vite output + copied wasm artefacts (gitignored)
 ```
@@ -39,10 +39,11 @@ npm install
 npm run dev    # rebuilds dist/ + vite on change
 ```
 
-After `dist/libtorrent.{js,wasm}` exists, the example harness can run:
+After `dist/libtorrent.{js,wasm}` exists, the app harness can run:
 
 ```sh
-cd example
+cp dist/libtorrent.{js,wasm} src/app/
+cd src/app
 npm install
 npm run dev    # vite dev server on :4560
 ```

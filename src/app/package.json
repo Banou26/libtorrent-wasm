@@ -1,5 +1,5 @@
 {
-  "name": "libtorrent-wasm-example",
+  "name": "libtorrent-wasm-app",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,12 +9,12 @@
   "dependencies": {
     "@webvpn/net": "^0.3.7",
     "@webvpn/dgram": "^0.3.7",
-    "@fkn/lib": "file:../../fkn/web/lib",
+    "@fkn/lib": "file:../../../fkn/web/lib",
     "osra": "^0.4.2",
     "ip-address": "^10.1.0"
   },
   "overrides": {
-    "@fkn/lib": "file:../../fkn/web/lib"
+    "@fkn/lib": "file:../../../fkn/web/lib"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
