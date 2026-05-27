@@ -1,0 +1,40 @@
+From bf1ff35ef5e172ba3465317f6d333da40bbe3ba0 Mon Sep 17 00:00:00 2001
+From: Banou <me@banou.dev>
+Date: Mon, 25 May 2026 01:28:09 +0900
+Subject: [PATCH] =?UTF-8?q?fix:=20=F0=9F=90=9Bunwedge=20UDP=20tick=20on=20?=
+ =?UTF-8?q?Emscripten=20+=20force=20i32-split=20syscall=20ABI?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/session_impl.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/session_impl.cpp b/src/session_impl.cpp
+index c0fa677ec..b1748d136 100644
+--- a/src/session_impl.cpp
++++ b/src/session_impl.cpp
+@@ -2661,7 +2661,18 @@ namespace {
+ 				}
+ 			}
+ 
+-			if (err == error::would_block || err == error::try_again)
++			if (err == error::would_block || err == error::try_again
++#ifdef __EMSCRIPTEN__
++				// On Emscripten the underlying recvfrom syscall (provided by
++				// library_fkn.js) returns -EAGAIN (11) to mean "queue empty".
++				// Boost.Asio's enum mapping on Emscripten ends up reporting
++				// this as `operation_aborted` (msg "Operation canceled")
++				// rather than `would_block` — they share the same numeric
++				// value here because of how ASIO_OS_DEF expands. Match by
++				// raw errno so the read loop actually terminates.
++				|| err.value() == 11
++#endif
++				)
+ 			{
+ 				// there are no more packets on the socket
+ 				break;
+-- 
+2.53.0
+

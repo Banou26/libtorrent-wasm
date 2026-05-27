@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>libtorrent-wasm demo</title>
+    <style>
+      body { font: 14px/1.4 system-ui, sans-serif; padding: 16px; max-width: 720px; }
+      input[type=text] { width: 100%; padding: 6px; font: inherit; }
+      button { padding: 6px 14px; font: inherit; }
+      .row { display: flex; gap: 8px; margin: 8px 0; }
+      pre { background: #111; color: #eee; padding: 10px; border-radius: 6px;
+            max-height: 320px; overflow: auto; }
+      .stat { font-variant-numeric: tabular-nums; }
+    </style>
+  </head>
+  <body>
+    <h1>libtorrent-wasm</h1>
+    <p>A minimal browser harness driving libtorrent in a Web Worker, with
+       TCP/UDP routed through @fkn/lib's WebVPN polyfills and disk backed by
+       OPFS.</p>
+
+    <div class="row">
+      <input id="magnet" type="text" placeholder="magnet:?xt=urn:btih:…" />
+      <button id="add">Add</button>
+    </div>
+
+    <div class="stat">
+      <strong>FDs:</strong> <span id="state">—</span><br />
+      <strong>Ticks:</strong> <span id="progress">0</span><br />
+      <strong>Net in:</strong> <span id="down">0 B/s</span>
+      <strong>Net out:</strong> <span id="up">0 B/s</span><br />
+      <strong>TCP in:</strong> <span id="tcp-in">0 KiB</span> /
+      <strong>UDP in:</strong> <span id="udp-in">0 KiB</span> /
+      <strong>Total in:</strong> <span id="seeds">0 KiB</span>
+    </div>
+
+    <h2>Alerts</h2>
+    <pre id="alerts"></pre>
+
+    <script>
+      // Node-stdlib shims expected by @fkn/lib transitive deps (buffer,
+      // stream, events). Match live.html: forward nextTick args, otherwise
+      // readable-stream's resume_(stream, state) runs with state=undefined.
+      window.global = window
+      window.process = { env: { NODE_DEBUG: '' }, version: '', nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)) }
+    </script>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

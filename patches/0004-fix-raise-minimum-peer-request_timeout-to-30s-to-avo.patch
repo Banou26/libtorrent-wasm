@@ -1,0 +1,39 @@
+From e11a628cd3ba57a1ae8ef217111e82293f3ed4b6 Mon Sep 17 00:00:00 2001
+From: Banou <me@banou.dev>
+Date: Mon, 25 May 2026 07:18:36 +0900
+Subject: [PATCH] =?UTF-8?q?fix:=20=F0=9F=90=9Braise=20minimum=20peer=20req?=
+ =?UTF-8?q?uest=5Ftimeout=20to=2030s=20to=20avoid=20snubbing=20fast=20loca?=
+ =?UTF-8?q?lhost=20peers?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/peer_connection.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/peer_connection.cpp b/src/peer_connection.cpp
+index 3f2d01a86..dad90b056 100644
+--- a/src/peer_connection.cpp
++++ b/src/peer_connection.cpp
+@@ -4562,7 +4562,16 @@ namespace libtorrent {
+ 		// timeouts should never be less than 2 seconds. The granularity is whole
+ 		// seconds, and only checked once per second. 2 is the minimum to avoid
+ 		// being considered timed out instantly
+-		return std::max(2, ret);
++		//
++		// WASM/browser patch: the adaptive timeout above produces seconds
++		// counted from `m_request_time.avg_deviation() * 4`. On a fast
++		// localhost peer that's ~0–2 ms, so ret rounds down to 0 and the
++		// effective timeout becomes the 2-second floor. Under heavy load
++		// the JS tick chain can stall the C++ session for >2 s — and a
++		// single such stall snubs the fast peer (drops desired-queue-size
++		// to 1, killing throughput). 30 s is well above any realistic
++		// tick stall while still letting genuinely silent peers time out.
++		return std::max(30, ret);
+ 	}
+ 
+ 	void peer_connection::get_peer_info(peer_info& p) const
+-- 
+2.53.0
+

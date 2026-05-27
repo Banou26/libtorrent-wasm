@@ -1,0 +1,51 @@
+{
+  "name": "libtorrent-wasm",
+  "version": "0.0.1",
+  "description": "libtorrent compiled to WebAssembly, single-threaded, transport over FKN WebVPN",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "files": [
+    "build"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./build/index.d.ts",
+      "import": "./build/index.js"
+    },
+    "./opfs": {
+      "types": "./build/opfs.d.ts",
+      "import": "./build/opfs.js"
+    },
+    "./types": {
+      "types": "./build/types.d.ts",
+      "import": "./build/types.js"
+    }
+  },
+  "scripts": {
+    "dev": "concurrently \"npm run dev-wasm\" \"npm run vite-build-dev\"",
+    "dev-wasm": "nodemon -e cpp,hpp,js --watch src --exec \"npm run make-docker\"",
+    "make-docker": "docker compose run --rm libtorrent-wasm make dist",
+    "docker-clean": "docker compose up --remove-orphans",
+    "vite-build": "vite build",
+    "vite-build-dev": "vite build --watch",
+    "build": "npm run make-docker && npm run vite-build && npm run types && npm run copy-wasm",
+    "types": "tsc",
+    "copy-wasm": "copyfiles -u 1 dist/libtorrent.js dist/libtorrent.wasm build",
+    "test": "playwright test"
+  },
+  "peerDependencies": {
+    "@webvpn/net": ">=0.3.0",
+    "@webvpn/dgram": ">=0.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/emscripten": "^1.40.0",
+    "concurrently": "^7.6.0",
+    "copyfiles": "^2.4.1",
+    "nodemon": "^2.0.22",
+    "playwright": "^1.60.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0"
+  }
+}
