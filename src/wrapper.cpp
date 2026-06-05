@@ -48,6 +48,9 @@ extern "C" int __syscall_setsockopt(int /*fd*/, int /*level*/, int /*optname*/,
 #include "libtorrent/sha1_hash.hpp"
 #include "libtorrent/hex.hpp"
 #include "libtorrent/info_hash.hpp"
+#include "libtorrent/file_storage.hpp"
+#include "libtorrent/torrent_flags.hpp"
+#include "libtorrent/download_priority.hpp"
 
 #include "disk_io.hpp"
 
@@ -99,6 +102,11 @@ alert_buffer g_pending_alerts;
 
 std::uint32_t register_handle(lt::torrent_handle h) {
   if (!h.is_valid()) return 0;
+  // Dedup by info-hash: a re-add (or a duplicate add_torrent_alert) must map to
+  // the SAME id, else handle_id_for_hash's join becomes ambiguous.
+  auto const key = h.info_hashes().get_best();
+  for (auto const& [eid, eh] : g_session->handles)
+    if (eh.is_valid() && eh.info_hashes().get_best() == key) return eid;
   auto id = g_session->next_handle_id++;
   g_session->handles.emplace(id, std::move(h));
   return id;
@@ -107,6 +115,110 @@ std::uint32_t register_handle(lt::torrent_handle h) {
 lt::torrent_handle* lookup_handle(std::uint32_t id) {
   auto it = g_session->handles.find(id);
   return it == g_session->handles.end() ? nullptr : &it->second;
+}
+
+// ---- streaming-read binary alert records ----------------------------------
+// JS can't read a torrent's file layout / piece bitfield through getters (they
+// sync_call → deadlock the single-threaded io_context). So we serialize the
+// streaming-critical data into the same length-prefixed alert stream JS already
+// drains, as typed binary records. Record ids avoid real libtorrent alert ids
+// (5/41/45/67/68) and the 0xFFFFFFFx diagnostic sentinels. All ints little-
+// endian (wasm32 LE; JS reads with DataView(..., true)).
+constexpr std::uint32_t REC_TORRENT_READY = 0xF0000001u;
+constexpr std::uint32_t REC_STATE_UPDATE  = 0xF0000002u;
+constexpr std::uint32_t REC_READ_PIECE    = 0xF0000003u;
+
+// Resolve our u32 handle-id from a torrent's best info-hash — the JOIN key the
+// disk bridge stores per storage. info_hashes()/get_best() read m_torrent
+// directly (no sync_call; proven safe by lt_torrent_infohash). O(N) over a
+// handful of handles.
+std::uint32_t handle_id_for_hash(lt::sha1_hash const& key) {
+  if (!g_session) return 0;
+  for (auto const& [id, h] : g_session->handles)
+    if (h.is_valid() && h.info_hashes().get_best() == key) return id;
+  return 0;
+}
+
+void put_record(std::uint32_t type, std::vector<std::uint8_t> const& payload) {
+  g_pending_alerts.put_u32(type);
+  g_pending_alerts.put_u32(static_cast<std::uint32_t>(payload.size()));
+  g_pending_alerts.put_bytes(payload.data(), payload.size());
+}
+
+// Returns false ONLY when the handle isn't registered yet (caller re-queues for
+// a later pump); true when emitted OR genuinely undeliverable (storage gone /
+// no metadata), which must NOT be retried.
+bool emit_torrent_ready(std::uint32_t storage_index) {
+  lt::wasm_storage_info si{};
+  if (lt::wasm_disk_storage_info(storage_index, &si) != 0) return true;
+  if (!si.fs || !si.fs->is_valid()) return true;
+  std::uint32_t const hid = handle_id_for_hash(si.info_hash);
+  if (hid == 0) return false;  // handle not registered yet — retry next pump
+  auto const* fs = si.fs;
+  int const nf = fs->num_files();
+  std::vector<std::uint8_t> p;
+  auto u32 = [&](std::uint32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+  auto i64 = [&](std::int64_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 8); };
+  u32(hid);
+  u32(storage_index);
+  u32(static_cast<std::uint32_t>(fs->piece_length()));
+  u32(static_cast<std::uint32_t>(fs->num_pieces()));
+  i64(fs->total_size());
+  u32(static_cast<std::uint32_t>(nf));
+  for (lt::file_index_t i{0}; i < lt::file_index_t{nf}; ++i) {
+    i64(fs->file_offset(i));
+    i64(fs->file_size(i));
+    std::string const path = fs->file_path(i);
+    u32(static_cast<std::uint32_t>(path.size()));
+    p.insert(p.end(), path.begin(), path.end());
+  }
+  put_record(REC_TORRENT_READY, p);
+  return true;
+}
+
+void emit_state_update(lt::state_update_alert const* sua) {
+  for (auto const& st : sua->status) {
+    std::uint32_t const hid = handle_id_for_hash(st.info_hashes.get_best());
+    if (hid == 0) continue;
+    int const nbits = st.pieces.size();
+    int const nbytes = (nbits + 7) / 8;
+    std::vector<std::uint8_t> p;
+    auto u32 = [&](std::uint32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+    auto i32 = [&](std::int32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+    auto i64 = [&](std::int64_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 8); };
+    auto f32 = [&](float v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+    u32(hid);
+    i32(static_cast<std::int32_t>(st.state));
+    i64(st.total_done);
+    i64(st.total_wanted);
+    f32(st.progress);
+    i32(st.download_payload_rate);
+    i32(st.upload_payload_rate);
+    i32(st.num_peers);
+    i32(st.num_seeds);
+    u32(static_cast<std::uint32_t>(nbits));
+    u32(static_cast<std::uint32_t>(nbytes));
+    std::size_t const base = p.size();
+    p.resize(base + static_cast<std::size_t>(nbytes), 0);
+    // MSB-first within each byte (bit 0 → 0x80 of byte 0) to match webtorrent +
+    // ripple's downloaded-ranges.ts.
+    for (int i = 0; i < nbits; ++i)
+      if (st.pieces.get_bit(i)) p[base + static_cast<std::size_t>(i / 8)] |= static_cast<std::uint8_t>(0x80u >> (i & 7));
+    put_record(REC_STATE_UPDATE, p);
+  }
+}
+
+void emit_read_piece(lt::read_piece_alert const* rpa) {
+  if (rpa->error) return;
+  std::uint32_t const hid = handle_id_for_hash(rpa->handle.info_hashes().get_best());
+  if (hid == 0) return;
+  std::vector<std::uint8_t> p;
+  auto u32 = [&](std::uint32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+  u32(hid);
+  u32(static_cast<std::uint32_t>(static_cast<int>(rpa->piece)));
+  u32(static_cast<std::uint32_t>(rpa->size));
+  p.insert(p.end(), rpa->buffer.get(), rpa->buffer.get() + rpa->size);
+  put_record(REC_READ_PIECE, p);
 }
 
 } // namespace
@@ -432,18 +544,35 @@ LT_API void lt_session_pump_alerts() {
   g_session->ses->pop_alerts(&alerts);
 
   for (auto* a : alerts) {
+    // state_update / read_piece carry their data in a binary record only — skip
+    // the generic text dup (read_piece's message() stringifies the whole piece).
+    if (auto* sua = lt::alert_cast<lt::state_update_alert>(a)) { emit_state_update(sua); continue; }
+    if (auto* rpa = lt::alert_cast<lt::read_piece_alert>(a)) { emit_read_piece(rpa); continue; }
+
     std::string msg = a->message();
     g_pending_alerts.put_u32(static_cast<std::uint32_t>(a->type()));
     g_pending_alerts.put_u32(static_cast<std::uint32_t>(msg.size()));
     g_pending_alerts.put_bytes(msg.data(), msg.size());
 
-    // When a torrent is added, libtorrent posts an add_torrent_alert
-    // carrying the handle. That's the only place we learn about handles
-    // for things we didn't add through our wrapper (e.g. resume data).
-    if (auto* ata = lt::alert_cast<lt::add_torrent_alert>(a)) {
+    // When a torrent is added, libtorrent posts an add_torrent_alert carrying
+    // the handle. That's the only place we learn about handles for things we
+    // didn't add through our wrapper (e.g. resume data). Keep its text record
+    // (small + useful for diagnostics).
+    if (auto* ata = lt::alert_cast<lt::add_torrent_alert>(a))
       register_handle(ata->handle);
-    }
   }
+
+  // Drain storages whose file_storage became available and emit the handle-keyed
+  // torrent-ready record. Done AFTER the loop so the handle (registered above at
+  // add_torrent_alert, possibly an earlier tick for a magnet) resolves by
+  // info-hash. Any storage whose handle isn't registered yet is RE-QUEUED for a
+  // later pump (never dropped — see emit_torrent_ready).
+  std::uint32_t ready[32];
+  std::vector<std::uint32_t> deferred;
+  for (int n; (n = lt::wasm_disk_take_ready(ready, 32)) > 0; )
+    for (int i = 0; i < n; ++i)
+      if (!emit_torrent_ready(ready[i])) deferred.push_back(ready[i]);
+  for (auto s : deferred) lt::wasm_disk_requeue_ready(s);
 }
 
 LT_API std::uint32_t lt_alerts_size() {
@@ -554,5 +683,65 @@ LT_API int lt_torrent_infohash(std::uint32_t id, char* out) {
   auto hash = ih.has_v2() ? ih.v2.to_string() : ih.v1.to_string();
   lt::aux::to_hex(hash, out);
   out[40] = '\0';
+  return 0;
+}
+
+// ---- streaming commands ---------------------------------------------------
+// All async_call on torrent_handle → safe under the single-threaded io_context
+// (unlike the *getters*, which sync_call → deadlock). The TS read() layer uses
+// these to prioritize + deadline the pieces covering a requested byte range so
+// a seek is served quickly instead of waiting for sequential download.
+
+// Toggle sequential download. set_sequential_download() is ABI-v1-only; the
+// modern path is set/unset_flags(sequential_download).
+LT_API int lt_torrent_set_sequential(std::uint32_t id, int on) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  if (on) h->set_flags(lt::torrent_flags::sequential_download);
+  else    h->unset_flags(lt::torrent_flags::sequential_download);
+  return 0;
+}
+
+// Request a whole piece's bytes; delivered as a read_piece_alert (→ REC_READ_PIECE).
+LT_API int lt_torrent_read_piece(std::uint32_t id, std::int32_t piece) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  h->read_piece(lt::piece_index_t{piece});
+  return 0;
+}
+
+// Prioritize a piece with a deadline (ms). alert_when_available != 0 also posts
+// a read_piece_alert once the piece lands — the signal the TS read() awaits.
+LT_API int lt_torrent_set_piece_deadline(std::uint32_t id, std::int32_t piece,
+                                         std::int32_t deadline_ms, int alert_when_available) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  lt::deadline_flags_t flags{};
+  if (alert_when_available) flags = lt::torrent_handle::alert_when_available;
+  h->set_piece_deadline(lt::piece_index_t{piece}, deadline_ms, flags);
+  return 0;
+}
+
+LT_API int lt_torrent_clear_piece_deadlines(std::uint32_t id) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  h->clear_piece_deadlines();
+  return 0;
+}
+
+// Set per-piece download priority for pieces [0, count) from a byte array
+// (0=skip, 1=low, 4=default, 7=top). Pieces beyond `count` keep their priority.
+LT_API int lt_torrent_prioritize_pieces(std::uint32_t id,
+                                        std::uint8_t const* prios, std::uint32_t count) {
+  if (!g_session || !prios) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  std::vector<lt::download_priority_t> v(count);
+  for (std::uint32_t i = 0; i < count; ++i) v[i] = lt::download_priority_t{prios[i]};
+  h->prioritize_pieces(v);
   return 0;
 }

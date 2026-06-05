@@ -25,7 +25,15 @@ export interface LtModule {
   _lt_session_remove_torrent(handle: number): number
 
   _lt_torrent_status(handle: number, out: number): number
+  _lt_torrent_post_status(handle: number): number
   _lt_torrent_infohash(handle: number, out: number): number
+
+  // streaming commands (all async on the libtorrent side → safe)
+  _lt_torrent_set_sequential(handle: number, on: number): number
+  _lt_torrent_read_piece(handle: number, piece: number): number
+  _lt_torrent_set_piece_deadline(handle: number, piece: number, deadlineMs: number, alertWhenAvailable: number): number
+  _lt_torrent_clear_piece_deadlines(handle: number): number
+  _lt_torrent_prioritize_pieces(handle: number, priosPtr: number, count: number): number
 }
 
 export type LtModuleFactory = (init?: Partial<{ fkn: FknHost; wasmBinary: ArrayBuffer }>) => Promise<LtModule>

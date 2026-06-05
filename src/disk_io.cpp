@@ -98,10 +98,19 @@ struct storage_entry {
   // Number of files; cached so we can validate file_index without
   // re-locking the torrent.
   int num_files;
+  // == storage_params.info_hash == handle.info_hashes().get_best(); the key the
+  // wrapper joins a storage_index to its torrent_handle / handle-id by.
+  sha1_hash info_hash;
 };
 
 struct wasm_disk_io;
 wasm_disk_io* g_disk_io = nullptr;
+
+// storage_index values whose file_storage just became available (notify_js_new
+// fired). Drained by the wrapper each pump to emit torrent-ready alert records.
+// Lives here (disk side) because only the disk_io is handed the populated
+// file_storage — post-metadata, so it works for magnets too.
+std::vector<std::uint32_t> g_storage_ready_queue;
 
 struct read_job {
   std::function<void(disk_buffer_holder, storage_error const&)> handler;
@@ -152,6 +161,7 @@ struct wasm_disk_io final
   }
   ~wasm_disk_io() override {
     g_disk_io = nullptr;
+    g_storage_ready_queue.clear();
   }
 
   // ---- bookkeeping -------------------------------------------------------
@@ -165,12 +175,18 @@ struct wasm_disk_io final
     e.fs        = &p.files;
     e.save_path = p.path;
     e.num_files = p.files.num_files();
+    e.info_hash = p.info_hash;
     m_storages.push_back(std::move(e));
     notify_js_new(static_cast<int>(idx));
     return storage_holder(idx, *this);
   }
 
   void remove_torrent(storage_index_t idx) override {
+    // Drop the file_storage pointer — it aliases the torrent_info, freed when the
+    // torrent goes away; query_storage's `!fs` guard then fails safe instead of
+    // dereferencing a dangling pointer.
+    auto const i = static_cast<std::size_t>(static_cast<int>(idx));
+    if (i < m_storages.size()) m_storages[i].fs = nullptr;
     js_disk_remove_storage(static_cast<int>(idx));
     // We don't reclaim the slot — storage_index_t is sparse-tolerant and
     // sessions don't typically churn through millions of torrents.
@@ -671,6 +687,16 @@ struct wasm_disk_io final
   void settings_updated() override {}
   void submit_jobs() override {}
 
+  // Deadlock-free geometry lookup for the streaming-read bridge (wrapper.cpp).
+  bool query_storage(std::uint32_t idx, wasm_storage_info& out) const {
+    auto* se = storage_at(storage_index_t{idx});
+    if (!se || !se->fs) return false;
+    out.info_hash = se->info_hash;
+    out.fs        = se->fs;
+    out.save_path = se->save_path.c_str();
+    return true;
+  }
+
 private:
   storage_entry const* storage_at(storage_index_t idx) const {
     auto i = static_cast<std::size_t>(static_cast<int>(idx));
@@ -713,6 +739,9 @@ private:
     json += "]";
     js_disk_new_storage(storage_id, se.save_path.c_str(),
                         json.c_str(), static_cast<int>(json.size()));
+    // Signal the wrapper (next pump) that this storage's geometry is ready, so
+    // it can emit the handle-keyed torrent-ready alert record.
+    g_storage_ready_queue.push_back(static_cast<std::uint32_t>(storage_id));
   }
 
   io_context& m_ios;
@@ -725,6 +754,24 @@ private:
 };
 
 } // namespace
+
+int wasm_disk_take_ready(std::uint32_t* out, int max) {
+  int n = 0;
+  while (n < max && !g_storage_ready_queue.empty()) {
+    out[n++] = g_storage_ready_queue.front();
+    g_storage_ready_queue.erase(g_storage_ready_queue.begin());
+  }
+  return n;
+}
+
+void wasm_disk_requeue_ready(std::uint32_t storage_index) {
+  g_storage_ready_queue.push_back(storage_index);
+}
+
+int wasm_disk_storage_info(std::uint32_t storage_index, wasm_storage_info* out) {
+  if (!g_disk_io || !out) return -1;
+  return g_disk_io->query_storage(storage_index, *out) ? 0 : -1;
+}
 
 std::unique_ptr<disk_interface> wasm_disk_io_constructor(
     io_context& ios, settings_interface const&, counters& cnt) {
