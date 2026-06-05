@@ -35,6 +35,11 @@
 addToLibrary({
   // ---- shared state, injected as $FKN ------------------------------------
   $FKN__deps: ['$ERRNO_CODES'],
+  // emscripten's jsifier evaluates this object in Node and JSON-serializes its
+  // data members — a live `new Map()` in the literal below becomes `{}`, so the
+  // fd table loses `.has`/`.set`/`.get`. Re-create it as a real Map in a postset
+  // (emitted verbatim after `var FKN = {…}`, before any socket syscall runs).
+  $FKN__postset: 'FKN.fds = new Map();',
   $FKN: {
     initialized: false,
 
@@ -66,7 +71,7 @@ addToLibrary({
     // give libc room for stdio (0–2) and any sockfs entries Emscripten may
     // allocate before we take over.
     nextFd: 16,
-    fds: new Map(), // fd → fd state
+    fds: null, // real Map assigned in $FKN__postset (see note above)
 
     // Tick scheduler: requested from JS callbacks when something becomes
     // ready that the C side hasn't seen yet.
