@@ -2,46 +2,33 @@ FROM emscripten/emsdk:4.0.3 AS build
 
 ARG MAKEFLAGS="-j4"
 
-# Boost is header-only for what libtorrent needs (asio + system + intrusive).
-# Debian's libboost-dev installs headers under /usr/include/boost — visible to
-# emcc by default because Emscripten's sysroot inherits the host include path
-# during cross-compile.
+# Build tooling only — the source (incl. the libtorrent submodule) is mounted at
+# /build by docker-compose, and `make dist` applies the patch series + runs
+# emcmake there. Nothing is baked in, so editing src/*.cpp just needs a re-run,
+# and the submodule's .git gitlink resolves (it's mounted, not COPYied — copying
+# it breaks the gitlink and `git apply` dies with exit 128).
 RUN apt-get update && \
-  apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    ninja-build \
-    libboost-dev \
-    git && \
+  apt-get install -y --no-install-recommends ninja-build curl ca-certificates git && \
   rm -rf /var/lib/apt/lists/*
 
-# Ensure Emscripten's tools override 'llvm-*'.
-ENV CC=emcc \
-    CXX=em++ \
-    AR=emar \
-    NM=emnm \
-    RANLIB=emranlib
+# Boost is header-only for what libtorrent uses (asio + system + intrusive). We
+# need a C++17-clean Boost: >=1.81 dropped std::unary_function, which emsdk
+# 4.0.3's libc++ (clang 21) removed with no escape hatch. Drop the headers INTO
+# the emscripten sysroot so emcc finds them natively — NOT via -I/usr/include,
+# which would shadow the cross sysroot's own libc headers (host glibc <stdint.h>
+# leaks → "bits/libc-header-start.h not found").
+ARG BOOST_VERSION=1.84.0
+RUN BV_US=$(echo "$BOOST_VERSION" | tr . _) && \
+    curl -fsSL "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BV_US}.tar.bz2" -o /tmp/boost.tar.bz2 && \
+    tar xf /tmp/boost.tar.bz2 -C /tmp && \
+    cp -r "/tmp/boost_${BV_US}/boost" "${EMSDK}/upstream/emscripten/cache/sysroot/include/" && \
+    rm -rf /tmp/boost.tar.bz2 "/tmp/boost_${BV_US}"
 
-# Bring in the submodule (mounted at build time by docker-compose) plus our
-# top-level files. We copy in two layers so editing src/*.cpp doesn't
-# invalidate the submodule layer.
-COPY libtorrent /build/libtorrent
-COPY patches /build/patches
-COPY CMakeLists.txt /build/CMakeLists.txt
-COPY src /build/src
+# Emscripten's tools override 'llvm-*'. (emcmake also sets the toolchain, but
+# these keep plain make/cmake invocations honest too.)
+ENV CC=emcc CXX=em++ AR=emar NM=emnm RANLIB=emranlib
+
+# The mounted repo is owned by the host user; let git operate on it regardless.
+RUN git config --system --add safe.directory '*'
 
 WORKDIR /build
-
-# Apply the upstream-touching patches against the pinned libtorrent submodule.
-# These are WASM-specific hacks that can't go upstream (uTP timestamp clamp,
-# WASI errno values, etc) — kept here as a transparent patch series.
-RUN cd libtorrent && \
-    for p in /build/patches/*.patch; do \
-      echo "applying $p" && git apply --whitespace=nowarn "$p"; \
-    done
-
-# Build.
-RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_TOOLCHAIN_FILE=${EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake \
-      -DBOOST_ROOT=/usr/include && \
-    cmake --build build

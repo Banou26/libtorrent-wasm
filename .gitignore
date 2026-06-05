@@ -1,6 +1,7 @@
 node_modules/
 build/
 dist/
+cmake-out/
 .em_cache/
 .playwright-mcp/
 .vitest-attachments/

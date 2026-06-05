@@ -44,14 +44,16 @@ export interface FknHost {
     => Promise<{ address: string; family: 0 | 4 | 6 } | { address: string; family: 0 | 4 | 6 }[] | undefined>
 }
 
-// The disk-IO contract a host implements. Every method may return Promise.
-// Methods unused by libtorrent in browser-mode are optional.
+// The disk-IO contract a host implements. Methods may return sync OR a Promise
+// — the disk bridge detects a Promise and only pays the microtask round-trip
+// then (the cached-handle hot path during streaming stays sync). Methods unused
+// by libtorrent in browser-mode are optional.
 export interface StorageBackend {
   onNewStorage(id: number, savePath: string, files: Array<{ path: string; size: number }>): void | Promise<void>
   onRemoveStorage(id: number): void | Promise<void>
 
-  read(id: number, fileIndex: number, offset: number, len: number): Promise<Uint8Array>
-  write(id: number, fileIndex: number, offset: number, bytes: Uint8Array): Promise<void>
+  read(id: number, fileIndex: number, offset: number, len: number): Uint8Array | Promise<Uint8Array>
+  write(id: number, fileIndex: number, offset: number, bytes: Uint8Array): void | Promise<void>
 
   release?(id: number): Promise<void>
   check?(id: number): Promise<number>  // status_t — 0 = no_error

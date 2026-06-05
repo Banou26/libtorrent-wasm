@@ -201,6 +201,9 @@ export class Session {
 
 export async function createSession(options: SessionOptions): Promise<Session> {
   const factory = options.moduleFactory
+    // libtorrent.js is the Emscripten glue emitted by the build and dropped
+    // next to this bundle by copy-wasm; it doesn't exist at typecheck time.
+    // @ts-ignore — generated sibling, resolved at runtime
     ?? (await import('./libtorrent.js')).default as LtModuleFactory
 
   // Build the FKN host object the JS library reads on init.

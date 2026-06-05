@@ -173,8 +173,8 @@ async function ensureDirRecursive(
 // minimal typings — TS lib.dom doesn't yet ship Sync handle methods fully
 declare global {
   interface FileSystemSyncAccessHandle {
-    read(buf: BufferSource, opts?: { at?: number }): number
-    write(buf: BufferSource, opts?: { at?: number }): number
+    read(buf: Uint8Array<ArrayBufferLike>, opts?: { at?: number }): number
+    write(buf: Uint8Array<ArrayBufferLike>, opts?: { at?: number }): number
     flush(): void
     close(): void
     truncate(size: number): void
