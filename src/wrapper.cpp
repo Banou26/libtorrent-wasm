@@ -276,7 +276,15 @@ LT_API int lt_session_create() {
   sp.set_int(lt::settings_pack::unchoke_slots_limit, 32);
   // The hot path is data movement, not bookkeeping. Disable the rate
   // smoothing that introduces small artificial waits.
-  sp.set_int(lt::settings_pack::mixed_mode_algorithm, lt::settings_pack::prefer_tcp);
+  // peer_proportional (not prefer_tcp): prefer_tcp *throttles* uTP to defer to
+  // TCP, but public swarms are uTP-dominant and our TCP peers are sparse — that
+  // throttle was starving the transport carrying most of the data. Share fairly.
+  sp.set_int(lt::settings_pack::mixed_mode_algorithm, lt::settings_pack::peer_proportional);
+  // uTP LEDBAT target delay (ms). Over the WebVPN tunnel the *constant* relay
+  // latency reads as congestion at the default 100ms, collapsing cwnd to the
+  // floor. Loosen it so uTP keeps the window open (the tunnel jitter, not real
+  // path congestion, is what we're tolerating here).
+  sp.set_int(lt::settings_pack::utp_target_delay, 600);
   // Re-enable uTP for real-world tests — public swarms have a mix of TCP and
   // uTP peers, and many seeders are uTP-first. prefer_tcp above already gives
   // TCP priority when both are available. uTP path caps at ~14 MiB/s due to
