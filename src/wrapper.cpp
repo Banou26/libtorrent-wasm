@@ -72,6 +72,10 @@ struct session_state {
   // torrent_handle is heavy and not trivially copyable across the C boundary;
   // we hand out small u32 ids and keep the real handles here.
   std::unordered_map<std::uint32_t, lt::torrent_handle> handles;
+  // Stable info-hash -> id map so add_magnet can return the SAME id the async
+  // add_torrent_alert will later register the real handle under (raw 20-byte
+  // key). Without this, add_* returns 0 while the handle is really 1+.
+  std::unordered_map<std::string, std::uint32_t> hash_ids;
   std::uint32_t next_handle_id = 1;
 };
 
@@ -100,15 +104,24 @@ struct alert_buffer {
 
 alert_buffer g_pending_alerts;
 
+// Stable id for an info-hash: reuse the one add_magnet pre-allocated (or a prior
+// registration), else mint a fresh one. Keyed by the raw 20-byte hash string.
+std::uint32_t id_for_hash(lt::sha1_hash const& key) {
+  if (!g_session) return 0;
+  auto const k = key.to_string();
+  auto it = g_session->hash_ids.find(k);
+  if (it != g_session->hash_ids.end()) return it->second;
+  auto id = g_session->next_handle_id++;
+  g_session->hash_ids.emplace(k, id);
+  return id;
+}
+
 std::uint32_t register_handle(lt::torrent_handle h) {
   if (!h.is_valid()) return 0;
-  // Dedup by info-hash: a re-add (or a duplicate add_torrent_alert) must map to
-  // the SAME id, else handle_id_for_hash's join becomes ambiguous.
-  auto const key = h.info_hashes().get_best();
-  for (auto const& [eid, eh] : g_session->handles)
-    if (eh.is_valid() && eh.info_hashes().get_best() == key) return eid;
-  auto id = g_session->next_handle_id++;
-  g_session->handles.emplace(id, std::move(h));
+  // Map to the stable id for this info-hash (the one add_magnet returned), so a
+  // re-add or a duplicate add_torrent_alert resolves to the SAME id.
+  auto const id = id_for_hash(h.info_hashes().get_best());
+  g_session->handles[id] = std::move(h);
   return id;
 }
 
@@ -607,21 +620,21 @@ LT_API void lt_alerts_clear() {
 
 // ---- torrents -------------------------------------------------------------
 
-// Add a torrent from a magnet URI. Returns 0 on success; the actual handle
-// arrives via add_torrent_alert (and pump_alerts registers it). Returning
-// 0/!=0 instead of the handle is the price we pay for the single-threaded
-// model: session_handle::add_torrent is a blocking sync_call that waits on
-// a condition variable for the io_context to process the dispatched lambda,
-// but our io_context only runs when JS calls _lt_session_tick(). So we
-// MUST use async_add_torrent — anything else deadlocks instantly.
+// Add a torrent from a magnet URI. Returns the (stable) handle id, pre-allocated
+// from the magnet's info-hash so JS gets the handle synchronously even though the
+// real torrent_handle only arrives async via add_torrent_alert (which registers
+// under the SAME id). add_torrent itself must be async: session_handle::add_torrent
+// is a blocking sync_call waiting on the io_context, but our io_context only runs
+// when JS calls _lt_session_tick(), so a sync add deadlocks instantly.
 LT_API int lt_session_add_magnet(char const* magnet, char const* save_path) {
   if (!g_session || !magnet) return -1;
   lt::error_code ec;
   lt::add_torrent_params atp = lt::parse_magnet_uri(magnet, ec);
   if (ec) return -2;
   atp.save_path = save_path ? save_path : ".";
+  auto const id = id_for_hash(atp.info_hashes.get_best());
   g_session->ses->async_add_torrent(std::move(atp));
-  return 0;
+  return static_cast<int>(id);
 }
 
 // Add a torrent from a .torrent file buffer. Same async semantics as above.
@@ -635,8 +648,9 @@ LT_API int lt_session_add_torrent_file(
   lt::add_torrent_params atp;
   atp.ti = std::move(ti);
   atp.save_path = save_path ? save_path : ".";
+  auto const id = id_for_hash(atp.ti->info_hashes().get_best());
   g_session->ses->async_add_torrent(std::move(atp));
-  return 0;
+  return static_cast<int>(id);
 }
 
 LT_API int lt_session_remove_torrent(std::uint32_t id) {
