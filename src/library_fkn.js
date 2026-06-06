@@ -1052,6 +1052,48 @@ addToLibrary({
     return FKN_poll(fdsPtr, nfds, 0)
   },
 
+  // Boost.Asio's reactor on Emscripten (epoll/kqueue/eventfd disabled) is the
+  // SELECT reactor, which calls select() -> __syscall__newselect. Emscripten's
+  // own select doesn't know our fake fds, so without this every async op
+  // (TCP connect/read/write AND UDP read) waits on the reactor forever. Mirror
+  // FKN_poll's readiness over select's fd_set bit arrays (fd N = byte N>>3,
+  // bit N&7; valid on little-endian wasm regardless of NFDBITS word size).
+  __syscall__newselect__deps: ['$FKN'],
+  __syscall__newselect: function(nfds, readPtr, writePtr, exceptPtr, _timeoutPtr) {
+    FKN.stats.poll++
+    if (nfds < 0) nfds = 0
+    if (nfds > 4096) nfds = 4096
+    const getBit = (ptr, fd) => ptr ? ((HEAPU8[ptr + (fd >>> 3)] >>> (fd & 7)) & 1) : 0
+    const setBit = (ptr, fd) => { if (ptr) HEAPU8[ptr + (fd >>> 3)] |= (1 << (fd & 7)) }
+    const wantR = [], wantW = [], wantE = []
+    for (let fd = 0; fd < nfds; fd++) {
+      if (getBit(readPtr, fd)) wantR.push(fd)
+      if (getBit(writePtr, fd)) wantW.push(fd)
+      if (getBit(exceptPtr, fd)) wantE.push(fd)
+    }
+    const nbytes = (nfds + 7) >>> 3
+    for (let i = 0; i < nbytes; i++) {
+      if (readPtr) HEAPU8[readPtr + i] = 0
+      if (writePtr) HEAPU8[writePtr + i] = 0
+      if (exceptPtr) HEAPU8[exceptPtr + i] = 0
+    }
+    const readable = (st) => st && (
+      (st.kind === 'tcp' && (st.recv.total > 0 || st.recv.fin)) ||
+      (st.kind === 'udp' && st.udpRecv.length > 0) ||
+      (st.kind === 'tcp-listen' && st.acceptQueue.length > 0)
+    )
+    const writable = (st) => st && (
+      (st.kind === 'tcp' && st.connected) ||
+      st.kind === 'udp'
+    )
+    let total = 0
+    for (const fd of wantR) { const st = FKN.fds.get(fd); if (readable(st) || (st && st.error)) { setBit(readPtr, fd); total++ } }
+    for (const fd of wantW) { const st = FKN.fds.get(fd); if (writable(st) || (st && st.error)) { setBit(writePtr, fd); total++ } }
+    for (const fd of wantE) { const st = FKN.fds.get(fd); if (st && st.error) { setBit(exceptPtr, fd); total++ } }
+    FKN.stats.pollReady += total
+    return total
+  },
+
   __syscall_fcntl64__deps: ['$FKN', '$FKN_fcntl'],
   __syscall_fcntl64: function(fd, cmd, varargs) {
     if (!FKN.fds.has(fd)) return -FKN.err.BADF
