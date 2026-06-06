@@ -1,0 +1,55 @@
+diff --git a/include/libtorrent/udp_socket.hpp b/include/libtorrent/udp_socket.hpp
+index bd72c0e53..2b0ca5b0d 100644
+--- a/include/libtorrent/udp_socket.hpp
++++ b/include/libtorrent/udp_socket.hpp
+@@ -37,6 +37,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ 
+ #include "libtorrent/socket.hpp"
+ #include "libtorrent/io_context.hpp"
++#include "libtorrent/deadline_timer.hpp"
+ #include "libtorrent/error_code.hpp"
+ #include "libtorrent/aux_/proxy_settings.hpp"
+ #include "libtorrent/debug.hpp"
+@@ -75,7 +76,20 @@ namespace aux { struct alert_manager; }
+ 		template <typename Handler>
+ 		void async_read(Handler&& h)
+ 		{
++#ifdef __EMSCRIPTEN__
++			// Emscripten's select-reactor never adds these sockets to its fd set,
++			// so async_wait(wait_read) is silently dropped and the read never
++			// fires. Poll-drive instead via a short timer (timers DO work — they
++			// run off the reactor's timer queue): on_udp_packet then drains the
++			// ENTIRE FKN dgram queue (EAGAIN-terminated) per fire and re-arms.
++			// The 1ms delay paces it to the JS tick without busy-looping poll().
++			auto timer = std::make_shared<deadline_timer>(m_ioc);
++			timer->expires_after(std::chrono::milliseconds(1));
++			timer->async_wait([timer, h = std::forward<Handler>(h)]
++				(error_code const&) mutable { h(error_code{}); });
++#else
+ 			m_socket.async_wait(udp::socket::wait_read, std::forward<Handler>(h));
++#endif
+ 		}
+ 
+ 		template <typename Handler>
+diff --git a/src/session_impl.cpp b/src/session_impl.cpp
+index c0fa677ec..f5d6ac04d 100644
+--- a/src/session_impl.cpp
++++ b/src/session_impl.cpp
+@@ -2661,7 +2661,16 @@ namespace {
+ 				}
+ 			}
+ 
+-			if (err == error::would_block || err == error::try_again)
++			if (err == error::would_block || err == error::try_again
++#ifdef __EMSCRIPTEN__
++				// FKN's recvfrom returns WASI EAGAIN (6) for "queue empty", but
++				// Asio's error::would_block compiles to musl EAGAIN (11), so the
++				// values don't match. Without this the drain falls through to the
++				// fatal-error path below and returns WITHOUT re-arming the read —
++				// inbound UDP wedges after the first batch. (11 kept for safety.)
++				|| err.value() == 6 || err.value() == 11
++#endif
++				)
+ 			{
+ 				// there are no more packets on the socket
+ 				break;

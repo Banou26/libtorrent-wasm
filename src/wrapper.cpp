@@ -469,6 +469,11 @@ LT_API int lt_diag_parse_interfaces(char const* str) {
 // so each spared round-trip is worth it.
 LT_API int lt_session_tick() {
   if (!g_session) return 0;
+  // Keep the io_context from "stopping" when the only pending work is an
+  // outstanding async_wait (e.g. the UDP socket's readability wait). Without
+  // this, poll() returns immediately without ever servicing the select-reactor
+  // on Emscripten, so on_udp_packet never fires and inbound UDP is wedged.
+  static auto work_guard = boost::asio::make_work_guard(g_session->ioc->get_executor());
   std::size_t ran = 0;
   try {
     auto const start = std::chrono::steady_clock::now();
