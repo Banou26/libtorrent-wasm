@@ -238,7 +238,12 @@ LT_API int lt_session_create() {
   // (which returns success even if the WebVPN can't actually accept
   // inbound), but the listen_socket_t entry is what tracker/UDP paths
   // attach themselves to.
-  sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6882");
+  // Port 0 = let the WebVPN assign an ephemeral host port. A fixed port (6882)
+  // makes the relay bind its host socket to that exact port, so a second client
+  // or a reconnecting one collides ("address already in use"), and the TCP
+  // listener half is refused outright (the relay only allows port-0 listeners).
+  // Ephemeral sidesteps both and matches how outbound-only browser peers behave.
+  sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:0");
   sp.set_bool(lt::settings_pack::enable_upnp, false);
   sp.set_bool(lt::settings_pack::enable_natpmp, false);
   sp.set_bool(lt::settings_pack::enable_lsd, false);
