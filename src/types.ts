@@ -22,7 +22,13 @@ export interface LtModule {
 
   _lt_session_add_magnet(magnet: number, savePath: number): number
   _lt_session_add_torrent_file(buf: number, len: number, savePath: number): number
+  _lt_session_add_torrent_with_resume(buf: number, len: number, savePath: number): number
   _lt_session_remove_torrent(handle: number): number
+  _lt_session_remove_torrent_ex(handle: number, deleteFiles: number): number
+
+  _lt_torrent_pause(handle: number): number
+  _lt_torrent_resume(handle: number): number
+  _lt_torrent_save_resume_data(handle: number): number
 
   _lt_torrent_status(handle: number, out: number): number
   _lt_torrent_post_status(handle: number): number

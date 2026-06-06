@@ -55,6 +55,7 @@ export interface TorrentStatus {
   numPiecesTotal: number
   numPiecesHave: number
   hasMetadata: boolean
+  paused: boolean
 }
 
 export interface FileEntry {
@@ -91,8 +92,10 @@ export interface Alert {
 const REC_TORRENT_READY = 0xf0000001
 const REC_STATE_UPDATE = 0xf0000002
 const REC_READ_PIECE = 0xf0000003
+const REC_RESUME_DATA = 0xf0000004
 
 type PieceWaiter = { handle: number, p0: number, p1: number, resolve: () => void }
+type ResumeWaiter = { handle: number, resolve: (data: Uint8Array) => void }
 
 export class Session {
   private mod: LtModule
@@ -106,6 +109,9 @@ export class Session {
   private statusByHandle = new Map<number, TorrentStatus>()
   // read() awaits the covering pieces becoming available (have-bit set).
   private pieceWaiters: PieceWaiter[] = []
+  // Latest fast-resume blob per handle + saveResumeData() awaiters.
+  private resumeByHandle = new Map<number, Uint8Array>()
+  private resumeWaiters: ResumeWaiter[] = []
 
   constructor(mod: LtModule, options: SessionOptions) {
     this.mod = mod
@@ -140,11 +146,43 @@ export class Session {
     }
   }
 
-  removeTorrent(handle: number) {
-    this.mod._lt_session_remove_torrent(handle)
+  // Re-add a torrent from a fast-resume blob (skips recheck + network
+  // re-download — the resume have-bitmask is trusted against the OPFS files).
+  addTorrentWithResume(resume: Uint8Array, savePath: string = '/downloads'): number {
+    const m = this.mod
+    const ptr = m._malloc(resume.length)
+    m.HEAPU8.set(resume, ptr)
+    const pathPtr = m.stringToNewUTF8(savePath)
+    try {
+      return m._lt_session_add_torrent_with_resume(ptr, resume.length, pathPtr) >>> 0
+    } finally {
+      m._free(ptr); m._free(pathPtr)
+    }
+  }
+
+  removeTorrent(handle: number, deleteFiles = false) {
+    this.mod._lt_session_remove_torrent_ex(handle, deleteFiles ? 1 : 0)
     this.filesByHandle.delete(handle)
     this.bitfieldByHandle.delete(handle)
     this.statusByHandle.delete(handle)
+    this.resumeByHandle.delete(handle)
+  }
+
+  pauseTorrent(handle: number) { this.mod._lt_torrent_pause(handle) }
+  resumeTorrent(handle: number) { this.mod._lt_torrent_resume(handle) }
+
+  // Snapshot fast-resume state. Resolves with the bencoded blob once libtorrent
+  // posts it (async). Rejects after a timeout so callers can't hang forever.
+  saveResumeData(handle: number, timeoutMs = 8000): Promise<Uint8Array> {
+    this.mod._lt_torrent_save_resume_data(handle)
+    return new Promise<Uint8Array>((resolve, reject) => {
+      const waiter: ResumeWaiter = { handle, resolve }
+      this.resumeWaiters.push(waiter)
+      setTimeout(() => {
+        const i = this.resumeWaiters.indexOf(waiter)
+        if (i >= 0) { this.resumeWaiters.splice(i, 1); reject(new Error('save_resume_data timed out')) }
+      }, timeoutMs)
+    })
   }
 
   // ---- streaming-read surface ----------------------------------------------
@@ -291,6 +329,7 @@ export class Session {
       if (off + len > size) break
       if (type === REC_TORRENT_READY) this.decodeTorrentReady(view, off)
       else if (type === REC_STATE_UPDATE) this.decodeStateUpdate(view, off)
+      else if (type === REC_RESUME_DATA) this.decodeResumeData(view, off, len)
       else if (type === REC_READ_PIECE) { /* fallback path — no MVP consumer */ }
       else out.push({ type, message: m.UTF8ToString(start + off, len) })
       off += len
@@ -298,6 +337,17 @@ export class Session {
     m._lt_alerts_clear()
     this.resolvePieceWaiters()
     return out
+  }
+
+  private decodeResumeData(view: DataView, off: number, len: number) {
+    const handle = view.getUint32(off, true)
+    const data = new Uint8Array(len - 4)
+    data.set(new Uint8Array(view.buffer, view.byteOffset + off + 4, len - 4))
+    this.resumeByHandle.set(handle, data)
+    this.resumeWaiters = this.resumeWaiters.filter(w => {
+      if (w.handle !== handle) return true
+      w.resolve(data); return false
+    })
   }
 
   private decodeTorrentReady(view: DataView, off: number) {
@@ -329,6 +379,7 @@ export class Session {
     const uploadRate = view.getInt32(off, true); off += 4
     const numPeers = view.getInt32(off, true); off += 4
     const numSeeds = view.getInt32(off, true); off += 4
+    const paused = view.getUint32(off, true) !== 0; off += 4
     const numPiecesTotal = view.getUint32(off, true); off += 4
     const bitfieldBytes = view.getUint32(off, true); off += 4
     // Copy out of the heap (it can be reallocated / cleared on the next pump).
@@ -339,7 +390,7 @@ export class Session {
     for (let i = 0; i < bitfieldBytes; i++) { let b = pieces[i]!; while (b) { numPiecesHave += b & 1; b >>= 1 } }
     this.statusByHandle.set(handle, {
       state, progress, totalDone, totalWanted, downloadRate, uploadRate,
-      numPeers, numSeeds, numPiecesTotal, numPiecesHave,
+      numPeers, numSeeds, numPiecesTotal, numPiecesHave, paused,
       hasMetadata: state !== TORRENT_STATE.downloadingMetadata,
     })
   }
@@ -364,6 +415,7 @@ export class Session {
     if (this.fallbackTimer != null) clearInterval(this.fallbackTimer)
     this.pieceWaiters.forEach(w => w.resolve())
     this.pieceWaiters = []
+    this.resumeWaiters = []
     this.mod._lt_session_destroy()
   }
 }

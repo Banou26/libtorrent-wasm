@@ -51,6 +51,9 @@ extern "C" int __syscall_setsockopt(int /*fd*/, int /*level*/, int /*optname*/,
 #include "libtorrent/file_storage.hpp"
 #include "libtorrent/torrent_flags.hpp"
 #include "libtorrent/download_priority.hpp"
+#include "libtorrent/write_resume_data.hpp"
+#include "libtorrent/read_resume_data.hpp"
+#include "libtorrent/session_handle.hpp"
 
 #include "disk_io.hpp"
 
@@ -140,6 +143,7 @@ lt::torrent_handle* lookup_handle(std::uint32_t id) {
 constexpr std::uint32_t REC_TORRENT_READY = 0xF0000001u;
 constexpr std::uint32_t REC_STATE_UPDATE  = 0xF0000002u;
 constexpr std::uint32_t REC_READ_PIECE    = 0xF0000003u;
+constexpr std::uint32_t REC_RESUME_DATA   = 0xF0000004u;
 
 // Resolve our u32 handle-id from a torrent's best info-hash — the JOIN key the
 // disk bridge stores per storage. info_hashes()/get_best() read m_torrent
@@ -209,6 +213,7 @@ void emit_state_update(lt::state_update_alert const* sua) {
     i32(st.upload_payload_rate);
     i32(st.num_peers);
     i32(st.num_seeds);
+    u32((st.flags & lt::torrent_flags::paused) ? 1u : 0u);
     u32(static_cast<std::uint32_t>(nbits));
     u32(static_cast<std::uint32_t>(nbytes));
     std::size_t const base = p.size();
@@ -232,6 +237,20 @@ void emit_read_piece(lt::read_piece_alert const* rpa) {
   u32(static_cast<std::uint32_t>(rpa->size));
   p.insert(p.end(), rpa->buffer.get(), rpa->buffer.get() + rpa->size);
   put_record(REC_READ_PIECE, p);
+}
+
+// Bencoded fast-resume blob (incl. the info-dict via save_info_dict, so a magnet
+// torrent re-adds without re-fetching metadata) keyed by our u32 handle id. JS
+// persists it and re-adds via lt_session_add_torrent_with_resume.
+void emit_resume_data(lt::save_resume_data_alert const* a) {
+  std::uint32_t const hid = handle_id_for_hash(a->params.info_hashes.get_best());
+  if (hid == 0) return;
+  std::vector<char> const buf = lt::write_resume_data_buf(a->params);
+  std::vector<std::uint8_t> p;
+  auto u32 = [&](std::uint32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+  u32(hid);
+  p.insert(p.end(), buf.begin(), buf.end());
+  put_record(REC_RESUME_DATA, p);
 }
 
 } // namespace
@@ -579,6 +598,8 @@ LT_API void lt_session_pump_alerts() {
     // the generic text dup (read_piece's message() stringifies the whole piece).
     if (auto* sua = lt::alert_cast<lt::state_update_alert>(a)) { emit_state_update(sua); continue; }
     if (auto* rpa = lt::alert_cast<lt::read_piece_alert>(a)) { emit_read_piece(rpa); continue; }
+    if (auto* srda = lt::alert_cast<lt::save_resume_data_alert>(a)) { emit_resume_data(srda); continue; }
+    if (lt::alert_cast<lt::save_resume_data_failed_alert>(a)) { continue; }
 
     std::string msg = a->message();
     g_pending_alerts.put_u32(static_cast<std::uint32_t>(a->type()));
@@ -660,6 +681,67 @@ LT_API int lt_session_remove_torrent(std::uint32_t id) {
   g_session->ses->remove_torrent(*h);
   g_session->handles.erase(id);
   return 0;
+}
+
+// Remove from the session, optionally deleting the downloaded files from storage
+// (OPFS). delete_files != 0 → also wipe the data; otherwise files stay for later.
+LT_API int lt_session_remove_torrent_ex(std::uint32_t id, int delete_files) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h) return -1;
+  lt::remove_flags_t flags = {};
+  if (delete_files) flags = lt::session_handle::delete_files;
+  g_session->ses->remove_torrent(*h, flags);
+  g_session->handles.erase(id);
+  return 0;
+}
+
+// Pause: unset auto_managed first so the queue logic doesn't auto-resume it, then
+// pause (disconnects peers, stops up+down — i.e. also stops seeding).
+LT_API int lt_torrent_pause(std::uint32_t id) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h) return -1;
+  h->unset_flags(lt::torrent_flags::auto_managed);
+  h->pause();
+  return 0;
+}
+
+LT_API int lt_torrent_resume(std::uint32_t id) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h) return -1;
+  h->set_flags(lt::torrent_flags::auto_managed);
+  h->resume();
+  return 0;
+}
+
+// Ask libtorrent to snapshot fast-resume state; arrives async as a
+// save_resume_data_alert → REC_RESUME_DATA. save_info_dict embeds the metadata.
+LT_API int lt_torrent_save_resume_data(std::uint32_t id) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h) return -1;
+  h->save_resume_data(lt::torrent_handle::save_info_dict);
+  return 0;
+}
+
+// Re-add a torrent from a bencoded fast-resume blob. no_verify_files makes
+// libtorrent TRUST the resume have-bitmask against the OPFS files → no recheck,
+// no network re-download (complete torrents go straight to seeding). Returns the
+// stable handle id (pre-allocated from the resume info-hash).
+LT_API int lt_session_add_torrent_with_resume(
+    std::uint8_t const* buf, std::uint32_t len, char const* save_path) {
+  if (!g_session || !buf || !len) return -1;
+  lt::error_code ec;
+  lt::add_torrent_params atp = lt::read_resume_data(
+      {reinterpret_cast<char const*>(buf), static_cast<std::ptrdiff_t>(len)}, ec);
+  if (ec) return -2;
+  if (save_path && *save_path) atp.save_path = save_path;
+  atp.flags |= lt::torrent_flags::no_verify_files;
+  auto const hid = id_for_hash(atp.info_hashes.get_best());
+  g_session->ses->async_add_torrent(std::move(atp));
+  return static_cast<int>(hid);
 }
 
 // Returns 0 on success and fills `out`. Layout matches js/index.ts.
