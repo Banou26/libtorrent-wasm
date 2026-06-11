@@ -2,10 +2,10 @@ FROM emscripten/emsdk:4.0.3 AS build
 
 ARG MAKEFLAGS="-j4"
 
-# Build tooling only — the source (incl. the libtorrent submodule) is mounted at
+# Build tooling only - the source (incl. the libtorrent submodule) is mounted at
 # /build by docker-compose, and `make dist` applies the patch series + runs
 # emcmake there. Nothing is baked in, so editing src/*.cpp just needs a re-run,
-# and the submodule's .git gitlink resolves (it's mounted, not COPYied — copying
+# and the submodule's .git gitlink resolves (it's mounted, not COPYied - copying
 # it breaks the gitlink and `git apply` dies with exit 128).
 RUN apt-get update && \
   apt-get install -y --no-install-recommends ninja-build curl ca-certificates git && \
@@ -14,7 +14,7 @@ RUN apt-get update && \
 # Boost is header-only for what libtorrent uses (asio + system + intrusive). We
 # need a C++17-clean Boost: >=1.81 dropped std::unary_function, which emsdk
 # 4.0.3's libc++ (clang 21) removed with no escape hatch. Drop the headers INTO
-# the emscripten sysroot so emcc finds them natively — NOT via -I/usr/include,
+# the emscripten sysroot so emcc finds them natively - NOT via -I/usr/include,
 # which would shadow the cross sysroot's own libc headers (host glibc <stdint.h>
 # leaks → "bits/libc-header-start.h not found").
 ARG BOOST_VERSION=1.84.0

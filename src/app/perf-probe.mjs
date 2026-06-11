@@ -39,17 +39,17 @@ try {
 
   const probe = async (label) => {
     const tries = []
-    // Probe A: trivial — does eval itself work?
+    // Probe A: trivial - does eval itself work?
     try {
       const a = await T(`${label}/trivial`, page.evaluate(() => 1+1), 1500)
       tries.push(`trivial=${a}`)
     } catch (e) { tries.push(`trivial=${e.message}`) }
-    // Probe B: read-only window field — no FKN touched
+    // Probe B: read-only window field - no FKN touched
     try {
       const b = await T(`${label}/url`, page.evaluate(() => document.location.href.length), 1500)
       tries.push(`url=${b}`)
     } catch (e) { tries.push(`url=${e.message}`) }
-    // Probe C: status (touches __FKN.fds.size + diag counters — no syscalls)
+    // Probe C: status (touches __FKN.fds.size + diag counters - no syscalls)
     try {
       const c = await T(`${label}/status`, page.evaluate(() => window.__status?.()), 1500)
       tries.push(`status=${JSON.stringify(c)}`)

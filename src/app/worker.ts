@@ -7,11 +7,11 @@
 // went unresponsive. With libtorrent in a Worker:
 //   - The tick chain has its own JS thread (this Worker).
 //   - The main thread keeps the FKN iframe and uses relayWorker() to bridge
-//     osra messages between iframe and worker — so the worker's @fkn/lib
+//     osra messages between iframe and worker - so the worker's @fkn/lib
 //     can call net/dgram transparently.
 
 // Node-stdlib shims (global, process). Imported separately so it runs
-// BEFORE the hoisted @webvpn/{net,dgram} imports — those transitively
+// BEFORE the hoisted @webvpn/{net,dgram} imports - those transitively
 // pull readable-stream which dereferences `process` at module-eval time.
 import './node-shims'
 
@@ -152,18 +152,18 @@ const init = async () => {
   inst._lt_session_create()
   // First handful of ticks: bring up listen sockets so FKN init runs.
   for (let i = 0; i < 30; i++) inst._lt_session_tick()
-  // Fallback heartbeat — libtorrent's internal timers (tracker retries,
+  // Fallback heartbeat - libtorrent's internal timers (tracker retries,
   // unchoke, etc.) need someone to tick the io_context to fire.
   setInterval(() => inst.__FKN?.scheduleTick(), 1000)
   ;(self as any).postMessage({ type: 'ready' })
 }
 
 // addEventListener (not self.onmessage = …) so we coexist with @fkn/lib's
-// relayWorker listener — assigning the property would clobber whichever
+// relayWorker listener - assigning the property would clobber whichever
 // listener was set last.
 self.addEventListener('message', (e: MessageEvent) => {
   const m = e.data
-  // Skip osra-shaped messages (those go to @fkn/lib's listener — they
+  // Skip osra-shaped messages (those go to @fkn/lib's listener - they
   // have a specific envelope shape and we'd misinterpret them).
   if (!m || typeof m !== 'object' || !m.type || typeof m.type !== 'string') return
   if (m.type !== 'add-magnet' && m.type !== 'poll') return

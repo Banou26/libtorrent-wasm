@@ -25,7 +25,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(LT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/libtorrent")
 
 if (NOT EXISTS "${LT_ROOT}/src/session_impl.cpp")
-  message(FATAL_ERROR "libtorrent submodule not initialized at ${LT_ROOT} — run `git submodule update --init --recursive`.")
+  message(FATAL_ERROR "libtorrent submodule not initialized at ${LT_ROOT}; run `git submodule update --init --recursive`.")
 endif()
 
 file(GLOB LT_SOURCES
@@ -35,8 +35,8 @@ file(GLOB LT_SOURCES
 )
 
 # Drop sources we *replace* with WASM-specific implementations, plus a few
-# that depend on facilities we won't run (UPnP/NAT-PMP — no LAN multicast in
-# the browser). Keep enum_net, file*, posix_* — they expose helpers
+# that depend on facilities we won't run (UPnP/NAT-PMP - no LAN multicast in
+# the browser). Keep enum_net, file*, posix_* - they expose helpers
 # session_impl references at link time even when the code paths are turned
 # off via TORRENT_USE_*.
 list(FILTER LT_SOURCES EXCLUDE REGEX "/(mmap_storage|mmap_disk_io|file_view_pool|file_mapping|file_pointer|drive_info)\\.cpp$")
@@ -44,11 +44,11 @@ list(FILTER LT_SOURCES EXCLUDE REGEX "/(mmap_storage|mmap_disk_io|file_view_pool
 # ----- libtorrent compile defines ------------------------------------------
 # Emscripten's wasm32-unknown-emscripten target doesn't set __linux__, so
 # libtorrent's config.hpp falls into the "unknown OS, assuming BSD" path.
-# Force the Linux branch — closest match for Emscripten's musl-based libc.
+# Force the Linux branch - closest match for Emscripten's musl-based libc.
 #
 # Note: settings tested with `#if FOO` take 0/1 values; settings tested with
 # `#ifdef FOO` must be UNDEFINED (passing FOO=0 still triggers `#ifdef`).
-# That's why TORRENT_USE_OPENSSL/GNUTLS don't appear below — leaving them
+# That's why TORRENT_USE_OPENSSL/GNUTLS don't appear below - leaving them
 # undefined is exactly what we want.
 set(LT_DEFS
   TORRENT_BUILDING_LIBRARY
@@ -95,7 +95,7 @@ target_compile_options(libtorrent PRIVATE
   -Wno-deprecated-declarations
 )
 
-# Diagnostic option — keep import names unmangled so
+# Diagnostic option - keep import names unmangled so
 # `WebAssembly.Module.imports()` is readable.
 option(DEBUG_NAMES "Keep WASM imports unmangled (diagnostic)" ON)
 
@@ -123,7 +123,7 @@ set(EM_LINK_FLAGS
   "-sALLOW_MEMORY_GROWTH=1"
   "-sMAXIMUM_MEMORY=2147483648"
 
-  # Helpers used by library_fkn.js — make sure they survive dead-code elim.
+  # Helpers used by library_fkn.js - make sure they survive dead-code elim.
   "-sEXPORTED_FUNCTIONS=['_lt_session_create','_lt_session_destroy','_lt_session_tick','_lt_session_pump_alerts','_lt_alerts_size','_lt_alerts_data','_lt_alerts_clear','_lt_session_add_magnet','_lt_session_add_torrent_file','_lt_session_remove_torrent','_lt_torrent_status','_lt_torrent_post_status','_lt_torrent_infohash','_lt_torrent_set_sequential','_lt_torrent_read_piece','_lt_torrent_set_piece_deadline','_lt_torrent_clear_piece_deadlines','_lt_torrent_prioritize_pieces','_lt_disk_complete_read','_lt_disk_complete_write','_lt_disk_complete_simple','_lt_disk_complete_status','_lt_disk_complete_move','_lt_disk_complete_delete','_lt_disk_complete_rename','_lt_dns_complete','_lt_diag_tick_count','_lt_diag_total_handlers','_lt_diag_open_tcp','_lt_diag_open_udp','_lt_diag_listen_port','_lt_diag_force_reopen','_lt_diag_listen_full','_lt_diag_parse_interfaces','_malloc','_free']"
   "-sEXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP32','HEAPU32','HEAP16','HEAPU16','UTF8ToString','stringToNewUTF8','lengthBytesUTF8']"
 

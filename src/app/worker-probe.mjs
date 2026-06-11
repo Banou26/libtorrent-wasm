@@ -32,9 +32,9 @@ try {
 
   await T('goto', page.goto(URL_, { waitUntil: 'commit' }), 8000)
   await T('wait-ready', page.waitForFunction(() => document.getElementById('state')?.textContent === 'ready', null, { timeout: 15000 }), 16000)
-  log('worker reports ready — adding magnet')
+  log('worker reports ready, adding magnet')
 
-  // BBB + Ubuntu LTS — more peers usually means we don't have to wait
+  // BBB + Ubuntu LTS - more peers usually means we don't have to wait
   // for one stalling tracker. Multiple trackers improves resilience.
   const magnet = process.argv[2] || 'magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A6969&tr=udp%3A%2F%2Fexodus.desync.com%3A6969'
   await page.evaluate((m) => {
@@ -68,7 +68,7 @@ try {
         `tcp[c=${d.connected}/-ing=${d.connecting}/d=${d.withData}/e=${d.errored}]`,
         `tot=${((r.udp.rx+r.tcp.rx)/1024/1024).toFixed(2)}MiB`)
     } catch (e) {
-      log(`t+${i}s FROZEN — ${e.message}`)
+      log(`t+${i}s FROZEN - ${e.message}`)
       break
     }
   }

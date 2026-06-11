@@ -89,7 +89,7 @@ namespace libtorrent {
 namespace {
 
 // Storage table: maps libtorrent's storage_index_t to per-torrent state.
-// The file_storage is referenced (not copied) — it is owned by the torrent
+// The file_storage is referenced (not copied) - it is owned by the torrent
 // and outlives our entry because remove_torrent on this object is called
 // before the torrent goes away.
 struct storage_entry {
@@ -109,7 +109,7 @@ wasm_disk_io* g_disk_io = nullptr;
 // storage_index values whose file_storage just became available (notify_js_new
 // fired). Drained by the wrapper each pump to emit torrent-ready alert records.
 // Lives here (disk side) because only the disk_io is handed the populated
-// file_storage — post-metadata, so it works for magnets too.
+// file_storage - post-metadata, so it works for magnets too.
 std::vector<std::uint32_t> g_storage_ready_queue;
 
 struct read_job {
@@ -182,13 +182,13 @@ struct wasm_disk_io final
   }
 
   void remove_torrent(storage_index_t idx) override {
-    // Drop the file_storage pointer — it aliases the torrent_info, freed when the
+    // Drop the file_storage pointer - it aliases the torrent_info, freed when the
     // torrent goes away; query_storage's `!fs` guard then fails safe instead of
     // dereferencing a dangling pointer.
     auto const i = static_cast<std::size_t>(static_cast<int>(idx));
     if (i < m_storages.size()) m_storages[i].fs = nullptr;
     js_disk_remove_storage(static_cast<int>(idx));
-    // We don't reclaim the slot — storage_index_t is sparse-tolerant and
+    // We don't reclaim the slot - storage_index_t is sparse-tolerant and
     // sessions don't typically churn through millions of torrents.
   }
 
@@ -334,7 +334,7 @@ struct wasm_disk_io final
     return false;
   }
 
-  // ---- hashing — done locally, no JS bounce ------------------------------
+  // ---- hashing - done locally, no JS bounce ------------------------------
 
   void async_hash(storage_index_t idx, piece_index_t piece,
       span<sha256_hash> v2, disk_job_flags_t flags,
@@ -356,7 +356,7 @@ struct wasm_disk_io final
     int const piece_size = se->fs->piece_size(piece);
     auto buf = std::make_shared<std::vector<char>>(piece_size);
     // Hashing kicks off a chain of small reads (one per block boundary
-    // is enough; here we issue one big read for the whole piece — JS may
+    // is enough; here we issue one big read for the whole piece - JS may
     // internally split it across files).
     peer_request r;
     r.piece = piece;
@@ -506,7 +506,7 @@ struct wasm_disk_io final
       std::function<void(storage_error const&,
           aux::vector<download_priority_t, file_index_t>)> handler) override
   {
-    // No real filesystem reshuffle in browser-land — just echo back.
+    // No real filesystem reshuffle in browser-land - just echo back.
     post(m_ios, [h = std::move(handler), p = std::move(prio)] () mutable {
       h(storage_error{}, std::move(p));
     });
@@ -678,7 +678,7 @@ struct wasm_disk_io final
   }
 
   void abort(bool) override {
-    // Pending jobs are dropped silently — JS may still call back, but
+    // Pending jobs are dropped silently - JS may still call back, but
     // complete_* will find no entry and return.
     std::lock_guard<std::mutex> g(m_mu);
     m_pending.clear();
@@ -708,7 +708,7 @@ private:
     auto* se = storage_at(idx);
     if (!se) { file_index = -1; file_offset = 0; return; }
     // map_block returns a list of (file, offset, size) slices the request
-    // overlaps. For the minimal first cut we just take the first one —
+    // overlaps. For the minimal first cut we just take the first one -
     // that's correct for reads/writes that stay within a single file
     // (the overwhelming majority once aligned to block boundaries). Truly
     // cross-file spans will be handled in a follow-up by issuing N slice
@@ -722,7 +722,7 @@ private:
   void notify_js_new(int storage_id) {
     auto const& se = m_storages[storage_id];
     // Build a tiny JSON description of files. We avoid pulling a full JSON
-    // library — write it by hand. file_storage::file_name returns string_view.
+    // library - write it by hand. file_storage::file_name returns string_view.
     std::string json = "[";
     for (file_index_t i{0}; i < file_index_t{se.num_files}; ++i) {
       if (static_cast<int>(i) > 0) json += ',';

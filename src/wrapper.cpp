@@ -1,4 +1,4 @@
-// libtorrent — minimal WASM C API
+// libtorrent - minimal WASM C API
 //
 // The shape of the bridge:
 //
@@ -23,7 +23,7 @@
 // emscripten_syscall_stubs.c that always returns -ENOPROTOOPT and prints
 // "warning: unsupported syscall: __syscall_setsockopt" once per call.
 // Boost.Asio reads that as "this socket can't be configured" and refuses
-// to write the BT handshake — that's why our 19 connected TCP fds had
+// to write the BT handshake - that's why our 19 connected TCP fds had
 // recv=0/send=0 across the board. Override with a strong symbol that
 // silently accepts everything. We don't have a real kernel here; the
 // rate-limit / NODELAY / KEEPALIVE knobs are no-ops over the WebVPN
@@ -89,7 +89,7 @@ session_state* g_session = nullptr;
 //
 //   u32 type        (alert id, matches libtorrent's alert::type())
 //   u32 size        (size of payload that follows, in bytes)
-//   <payload>       (UTF-8 text for now — same as alert::message())
+//   <payload>       (UTF-8 text for now - same as alert::message())
 //
 // Keeping this binary instead of JSON avoids the JSON-encode cost on hot
 // alerts like block_finished_alert.
@@ -145,7 +145,7 @@ constexpr std::uint32_t REC_STATE_UPDATE  = 0xF0000002u;
 constexpr std::uint32_t REC_READ_PIECE    = 0xF0000003u;
 constexpr std::uint32_t REC_RESUME_DATA   = 0xF0000004u;
 
-// Resolve our u32 handle-id from a torrent's best info-hash — the JOIN key the
+// Resolve our u32 handle-id from a torrent's best info-hash - the JOIN key the
 // disk bridge stores per storage. info_hashes()/get_best() read m_torrent
 // directly (no sync_call; proven safe by lt_torrent_infohash). O(N) over a
 // handful of handles.
@@ -170,7 +170,7 @@ bool emit_torrent_ready(std::uint32_t storage_index) {
   if (lt::wasm_disk_storage_info(storage_index, &si) != 0) return true;
   if (!si.fs || !si.fs->is_valid()) return true;
   std::uint32_t const hid = handle_id_for_hash(si.info_hash);
-  if (hid == 0) return false;  // handle not registered yet — retry next pump
+  if (hid == 0) return false;  // handle not registered yet - retry next pump
   auto const* fs = si.fs;
   int const nf = fs->num_files();
   std::vector<std::uint8_t> p;
@@ -272,7 +272,7 @@ LT_API int lt_session_create() {
   // attach themselves to.
   // A fixed, non-zero port so getsockname() returns it synchronously (the WebVPN
   // bind is async, so a :0 request reads back as port 0 until the bound packet
-  // arrives — and libtorrent needs a valid local port up-front to bring up the
+  // arrives - and libtorrent needs a valid local port up-front to bring up the
   // listen_socket's receive loop). The relay binds its host socket ephemerally
   // and reports 6882 back, so there's no host-port conflict between clients.
   sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6882");
@@ -294,22 +294,22 @@ LT_API int lt_session_create() {
   sp.set_int(lt::settings_pack::send_buffer_watermark_factor, 150);
   // max_out_request_queue caps in-flight piece requests per peer. At
   // 20+ MiB/s × default request_queue_time of 3s × 16 KiB blocks, the
-  // desired queue size hits ~4000 — old 1500 triggered the
+  // desired queue size hits ~4000 - old 1500 triggered the
   // outstanding_request_limit_reached performance warning right before
   // peers got "snubbed" because we couldn't keep them fed. Lift it.
   sp.set_int(lt::settings_pack::max_out_request_queue, 5000);
   sp.set_int(lt::settings_pack::connections_limit, 500);
   // Keep peers from being declared "snubbed" while we're processing a
-  // burst — defaults assume ~100ms response latency; our JS tick chain
+  // burst - defaults assume ~100ms response latency; our JS tick chain
   // can stretch that under heavy load.
   sp.set_int(lt::settings_pack::peer_timeout, 240);
   sp.set_int(lt::settings_pack::request_timeout, 120);
-  // Speed up peer selection — defaults bias for long-running clients.
+  // Speed up peer selection - defaults bias for long-running clients.
   sp.set_int(lt::settings_pack::unchoke_slots_limit, 32);
   // The hot path is data movement, not bookkeeping. Disable the rate
   // smoothing that introduces small artificial waits.
   // peer_proportional (not prefer_tcp): prefer_tcp *throttles* uTP to defer to
-  // TCP, but public swarms are uTP-dominant and our TCP peers are sparse — that
+  // TCP, but public swarms are uTP-dominant and our TCP peers are sparse - that
   // throttle was starving the transport carrying most of the data. Share fairly.
   sp.set_int(lt::settings_pack::mixed_mode_algorithm, lt::settings_pack::peer_proportional);
   // uTP LEDBAT target delay (ms). Over the WebVPN tunnel the *constant* relay
@@ -317,12 +317,12 @@ LT_API int lt_session_create() {
   // floor. Loosen it so uTP keeps the window open (the tunnel jitter, not real
   // path congestion, is what we're tolerating here).
   sp.set_int(lt::settings_pack::utp_target_delay, 600);
-  // Re-enable uTP for real-world tests — public swarms have a mix of TCP and
+  // Re-enable uTP for real-world tests - public swarms have a mix of TCP and
   // uTP peers, and many seeders are uTP-first. prefer_tcp above already gives
   // TCP priority when both are available. uTP path caps at ~14 MiB/s due to
   // LEDBAT delay sensitivity but is still much better than no peer.
   // DHT bootstraps via DNS to router.bittorrent.com / utorrent.com which
-  // would spawn a resolver worker thread — fails hard under -sUSE_PTHREADS=0.
+  // would spawn a resolver worker thread - fails hard under -sUSE_PTHREADS=0.
   // Disable for now; can be re-enabled once the JS-side DNS path is wired.
   sp.set_bool(lt::settings_pack::enable_dht, false);
   // Force the disk/hashing pools to size 0 so nothing tries pthread_create.
@@ -333,7 +333,7 @@ LT_API int lt_session_create() {
   // Pull the production-relevant categories. The *_log categories
   // (session_log, torrent_log, peer_log, dht_log, picker_log) were on
   // earlier for diagnosis but each emits dozens of message-rich alerts
-  // per tick once a torrent is active — the alert queue grows, every
+  // per tick once a torrent is active - the alert queue grows, every
   // call to pop_alerts walks more entries, and the JS thread spends
   // most of its time draining them. Off by default; flip via
   // lt_session_set_log_verbose() when actively debugging.
@@ -363,7 +363,7 @@ LT_API int lt_session_create() {
   // boost.asio's resolver service, ip_change_notifier on Linux), which
   // fails under -sUSE_PTHREADS=0. session_impl::wrap() catches the
   // resulting system_error and calls pause(). Resume immediately so the
-  // session actually does work — the failed thread spawn doesn't break
+  // session actually does work - the failed thread spawn doesn't break
   // anything else, it just means the corresponding optional facility (DNS
   // worker, NIC-change watcher) is unavailable.
   g_session->ses->resume();
@@ -389,7 +389,7 @@ LT_API void lt_session_destroy() {
 //   - a timer expires
 // Combined with non-blocking sockets, this gives us an event-driven loop
 // without Asyncify.
-// Tick stats — readable via lt_diag_*().
+// Tick stats - readable via lt_diag_*().
 static std::int64_t g_tick_count = 0;
 static std::int64_t g_total_handlers = 0;
 
@@ -417,7 +417,7 @@ LT_API int lt_diag_open_tcp() {
   }
 }
 
-// Full chain: acceptor.open + bind + listen — exactly what session_impl does
+// Full chain: acceptor.open + bind + listen - exactly what session_impl does
 // in setup_listener.
 LT_API int lt_diag_listen_full() {
   if (!g_session) return -1;
@@ -455,7 +455,7 @@ LT_API int lt_diag_open_udp() {
   }
 }
 
-// Trigger a listen_port query — this round-trips through the io_context.
+// Trigger a listen_port query - this round-trips through the io_context.
 LT_API int lt_diag_listen_port() {
   if (!g_session) return -1;
   return g_session->ses->listen_port();
@@ -494,7 +494,7 @@ LT_API int lt_diag_parse_interfaces(char const* str) {
 }
 
 // Per-tick handler budget. io_context::poll() would otherwise drain the
-// entire ready queue in one synchronous call — when libtorrent kicks off a
+// entire ready queue in one synchronous call - when libtorrent kicks off a
 // torrent it posts hundreds of handlers at once and a single tick can pin
 // the main thread for 100s of ms. Capping forces JS to get control back
 // between batches; the JS side rearms scheduleTick when this returns the
@@ -594,7 +594,7 @@ LT_API void lt_session_pump_alerts() {
   g_session->ses->pop_alerts(&alerts);
 
   for (auto* a : alerts) {
-    // state_update / read_piece carry their data in a binary record only — skip
+    // state_update / read_piece carry their data in a binary record only - skip
     // the generic text dup (read_piece's message() stringifies the whole piece).
     if (auto* sua = lt::alert_cast<lt::state_update_alert>(a)) { emit_state_update(sua); continue; }
     if (auto* rpa = lt::alert_cast<lt::read_piece_alert>(a)) { emit_read_piece(rpa); continue; }
@@ -618,7 +618,7 @@ LT_API void lt_session_pump_alerts() {
   // torrent-ready record. Done AFTER the loop so the handle (registered above at
   // add_torrent_alert, possibly an earlier tick for a magnet) resolves by
   // info-hash. Any storage whose handle isn't registered yet is RE-QUEUED for a
-  // later pump (never dropped — see emit_torrent_ready).
+  // later pump (never dropped - see emit_torrent_ready).
   std::uint32_t ready[32];
   std::vector<std::uint32_t> deferred;
   for (int n; (n = lt::wasm_disk_take_ready(ready, 32)) > 0; )
@@ -697,7 +697,7 @@ LT_API int lt_session_remove_torrent_ex(std::uint32_t id, int delete_files) {
 }
 
 // Pause: unset auto_managed first so the queue logic doesn't auto-resume it, then
-// pause (disconnects peers, stops up+down — i.e. also stops seeding).
+// pause (disconnects peers, stops up+down - i.e. also stops seeding).
 LT_API int lt_torrent_pause(std::uint32_t id) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -767,7 +767,7 @@ struct torrent_status_out {
   std::int32_t  has_metadata;
 };
 
-// Status query — non-blocking. Requests a status update; the result arrives
+// Status query - non-blocking. Requests a status update; the result arrives
 // as a state_update_alert that JS can pull through pump_alerts. We can't
 // call h->status() directly here because it's a sync_call that waits on a
 // condition variable for the io_context to process the dispatched lambda,
@@ -827,7 +827,7 @@ LT_API int lt_torrent_read_piece(std::uint32_t id, std::int32_t piece) {
 }
 
 // Prioritize a piece with a deadline (ms). alert_when_available != 0 also posts
-// a read_piece_alert once the piece lands — the signal the TS read() awaits.
+// a read_piece_alert once the piece lands - the signal the TS read() awaits.
 LT_API int lt_torrent_set_piece_deadline(std::uint32_t id, std::int32_t piece,
                                          std::int32_t deadline_ms, int alert_when_available) {
   if (!g_session) return -1;

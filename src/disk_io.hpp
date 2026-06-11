@@ -37,7 +37,7 @@ struct wasm_storage_info {
 int wasm_disk_take_ready(std::uint32_t* out, int max);
 
 // Re-queue a storage_index the wrapper couldn't emit yet (handle not registered
-// at drain time). Picked up on a later pump — NOT the current one.
+// at drain time). Picked up on a later pump - NOT the current one.
 void wasm_disk_requeue_ready(std::uint32_t storage_index);
 
 // Look up cached geometry for a storage_index. Returns 0 on success.

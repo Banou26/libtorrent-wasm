@@ -30,7 +30,7 @@ reset-submodule:
 
 # ---- emscripten compile (inside docker) -----------------------------------
 # emcmake wires the Emscripten toolchain (compiler + sysroot include order, so
-# Boost — staged into the sysroot by the Dockerfile — resolves without leaking
+# Boost - staged into the sysroot by the Dockerfile - resolves without leaking
 # host headers). Build in `cmake-out`, NOT `build/`: that's the npm package dir
 # vite + copy-wasm write into, and a shared dir collides (root-owned cmake
 # intermediates then block the host vite write).

@@ -51,7 +51,7 @@ npm run dev    # vite dev server on :4560
 ## Patches
 
 `patches/*.patch` carry the WASM-specific edits on top of pinned upstream
-libtorrent — uTP LEDBAT bypass, WASI errno values, FIONREAD tolerance, etc.
+libtorrent: uTP LEDBAT bypass, WASI errno values, FIONREAD tolerance, etc.
 They're applied via `git apply` at build time (`make apply-patches`). To
 rebase against a newer upstream, bump the submodule and rerun `make
 apply-patches`; rejected hunks must be reconciled manually.

@@ -1,6 +1,6 @@
 // Public API for the libtorrent WASM module.
 //
-// Usage from a Web Worker (recommended — keeps the main thread responsive):
+// Usage from a Web Worker (recommended - keeps the main thread responsive):
 //
 //   import { createSession } from 'libtorrent-wasm'
 //   import * as net from '@webvpn/net'
@@ -12,7 +12,7 @@
 //   for await (const alert of session.alerts()) { … }      // pumps the engine
 //   const bytes = await session.read(handle, 0, offset, len) // stream a file
 //
-// The session owns its own tick scheduler — it pumps on a microtask whenever
+// The session owns its own tick scheduler - it pumps on a microtask whenever
 // the C side signals via Module.fkn.scheduleTick(), and on a 250 ms timer as
 // a fallback for internal libtorrent timers (DHT bucket refresh, tracker
 // announces, etc).
@@ -24,12 +24,12 @@ export interface SessionOptions {
   net: any
   /** @fkn/lib's dgram module (or @webvpn/dgram) */
   dgram: any
-  /** Disk backend — defaults to a no-op (download but discard). Streaming
+  /** Disk backend - defaults to a no-op (download but discard). Streaming
    *  `read()` requires a backend that can read back (e.g. OPFSStorage). */
   storage?: StorageBackend
   /** Override the WASM module factory (testing) */
   moduleFactory?: LtModuleFactory
-  /** Fallback tick interval in ms — used when nothing else pumps */
+  /** Fallback tick interval in ms - used when nothing else pumps */
   tickIntervalMs?: number
 }
 
@@ -147,7 +147,7 @@ export class Session {
   }
 
   // Re-add a torrent from a fast-resume blob (skips recheck + network
-  // re-download — the resume have-bitmask is trusted against the OPFS files).
+  // re-download - the resume have-bitmask is trusted against the OPFS files).
   addTorrentWithResume(resume: Uint8Array, savePath: string = '/downloads'): number {
     const m = this.mod
     const ptr = m._malloc(resume.length)
@@ -312,7 +312,7 @@ export class Session {
 
   // Pump the engine and decode all pending records. Binary records (torrent-
   // ready / state-update / read-piece) update internal caches as a side effect;
-  // remaining (text) alerts are returned. Eager — NOT a generator — so the cache
+  // remaining (text) alerts are returned. Eager - NOT a generator - so the cache
   // updates always run even if the caller ignores the returned text alerts.
   popAlerts(): Alert[] {
     const m = this.mod
@@ -330,7 +330,7 @@ export class Session {
       if (type === REC_TORRENT_READY) this.decodeTorrentReady(view, off)
       else if (type === REC_STATE_UPDATE) this.decodeStateUpdate(view, off)
       else if (type === REC_RESUME_DATA) this.decodeResumeData(view, off, len)
-      else if (type === REC_READ_PIECE) { /* fallback path — no MVP consumer */ }
+      else if (type === REC_READ_PIECE) { /* fallback path - no MVP consumer */ }
       else out.push({ type, message: m.UTF8ToString(start + off, len) })
       off += len
     }
@@ -395,7 +395,7 @@ export class Session {
     })
   }
 
-  // Async iterator over text alerts — pumps until destroy(). The pump also
+  // Async iterator over text alerts - pumps until destroy(). The pump also
   // refreshes files()/bitfield()/status() and resolves read() waiters.
   async *alerts(): AsyncIterableIterator<Alert> {
     while (!this.destroyed) {
@@ -424,7 +424,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
   const factory = options.moduleFactory
     // libtorrent.js is the Emscripten glue emitted by the build and dropped
     // next to this bundle by copy-wasm; it doesn't exist at typecheck time.
-    // @ts-ignore — generated sibling, resolved at runtime
+    // @ts-ignore - generated sibling, resolved at runtime
     ?? (await import('./libtorrent.js')).default as LtModuleFactory
 
   // Build the FKN host object the JS library reads on init.

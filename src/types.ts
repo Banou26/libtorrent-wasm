@@ -59,7 +59,7 @@ export interface FknHost {
 }
 
 // The disk-IO contract a host implements. Methods may return sync OR a Promise
-// — the disk bridge detects a Promise and only pays the microtask round-trip
+// - the disk bridge detects a Promise and only pays the microtask round-trip
 // then (the cached-handle hot path during streaming stays sync). Methods unused
 // by libtorrent in browser-mode are optional.
 export interface StorageBackend {
@@ -70,7 +70,7 @@ export interface StorageBackend {
   write(id: number, fileIndex: number, offset: number, bytes: Uint8Array): void | Promise<void>
 
   release?(id: number): Promise<void>
-  check?(id: number): Promise<number>  // status_t — 0 = no_error
+  check?(id: number): Promise<number>  // status_t - 0 = no_error
   move?(id: number, newPath: string): Promise<void>
   deleteFiles?(id: number, flags: number): Promise<void>
   rename?(id: number, fileIndex: number, newName: string): Promise<void>

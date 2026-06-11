@@ -15,7 +15,7 @@ export default defineConfig({
       formats: ['es'],
     },
     rollupOptions: {
-      // Don't try to bundle the emscripten glue — `src/index.ts` dynamic-imports
+      // Don't try to bundle the emscripten glue - `src/index.ts` dynamic-imports
       // `./libtorrent.js` at runtime, which copy-wasm puts alongside the bundle.
       external: ['./libtorrent.js', '../dist/libtorrent.js'],
       output: {

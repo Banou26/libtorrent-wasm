@@ -1,7 +1,7 @@
 // OPFS-backed StorageBackend. Each torrent gets a directory under the OPFS
 // root; each file becomes one OPFS file. Reads use FileSystemFileHandle's
 // .read at offset; writes use FileSystemSyncAccessHandle which is sync &
-// fast — but only available inside Workers.
+// fast - but only available inside Workers.
 //
 // Run from a Worker. Calling this from the main thread will throw.
 
@@ -40,7 +40,7 @@ export class OPFSStorage implements StorageBackend {
     this.storages.delete(id)
   }
 
-  // Note: return type is a union of sync and Promise — js_disk_read/write
+  // Note: return type is a union of sync and Promise - js_disk_read/write
   // detect this and skip the microtask round-trip when the file handle is
   // already cached, which is the steady-state hot path during streaming.
   read(id: number, fileIndex: number, offset: number, len: number): Uint8Array | Promise<Uint8Array> {
@@ -127,7 +127,7 @@ export class OPFSStorage implements StorageBackend {
   // otherwise a Promise that resolves to one. Hot-path reads/writes pay
   // zero microtask cost once the handle has been opened the first time.
   // Concurrent callers for the same file share one in-flight Promise so
-  // we never invoke createSyncAccessHandle() twice for the same file —
+  // we never invoke createSyncAccessHandle() twice for the same file -
   // the second call would throw the "same file" lock error.
   private openFile(id: number, fileIndex: number): FileSystemSyncAccessHandle | Promise<FileSystemSyncAccessHandle> {
     const e = this.storages.get(id)
@@ -170,7 +170,7 @@ async function ensureDirRecursive(
   return dir
 }
 
-// minimal typings — TS lib.dom doesn't yet ship Sync handle methods fully
+// minimal typings - TS lib.dom doesn't yet ship Sync handle methods fully
 declare global {
   interface FileSystemSyncAccessHandle {
     read(buf: Uint8Array<ArrayBufferLike>, opts?: { at?: number }): number

@@ -22,7 +22,7 @@ try {
   page.setDefaultTimeout(3000)
   page.on('console', m => {
     const t = m.text()
-    // Only surface signal — drop the [vite] HMR chatter and the WASM startup spam.
+    // Only surface signal - drop the [vite] HMR chatter and the WASM startup spam.
     if (/^\[(vite|FKN)\]/.test(t) || /^\[lt\]/.test(t) || /unsupported syscall/.test(t)) return
     log('  console', m.type(), t)
   })
@@ -36,7 +36,7 @@ try {
 
   await T('goto', page.goto(URL_, { waitUntil: 'commit' }), 8000)
   await T('wasm-up', page.waitForFunction(() => !!window.__inst, null, { timeout: 15000 }), 16000)
-  log('WASM up — adding magnet…')
+  log('WASM up, adding magnet…')
   await T('add', page.evaluate(() => window.__add()), 5000)
 
   for (let i = 1; i <= 30; i++) {
@@ -45,7 +45,7 @@ try {
       const s = await T(`poll${i}`, page.evaluate(() => window.__status()), 1500)
       log(`t+${i}s`, JSON.stringify(s))
     } catch (e) {
-      log(`t+${i}s FROZEN — ${e.message}`)
+      log(`t+${i}s FROZEN - ${e.message}`)
       break
     }
   }

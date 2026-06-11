@@ -1,7 +1,7 @@
 // Main thread: hosts the @fkn/lib iframe (auto-injected on import), bridges
 // osra messages to the worker via relayWorker, pipes UI events through to
 // the worker, and renders status updates back. All libtorrent + WASM work
-// happens in the worker — the worker is single-threaded which matches the
+// happens in the worker - the worker is single-threaded which matches the
 // wasm build (no SAB needed).
 
 import { relayWorker } from '@fkn/lib'
@@ -30,7 +30,7 @@ const fmtBytes = (bytes: number) => {
   return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GiB'
 }
 
-// addEventListener — safer than `worker.onmessage =` when @fkn/lib's
+// addEventListener - safer than `worker.onmessage =` when @fkn/lib's
 // relayWorker is also wiring listeners on this worker.
 worker.addEventListener('message', (ev: MessageEvent) => {
   const msg = ev.data
@@ -59,7 +59,7 @@ worker.addEventListener('message', (ev: MessageEvent) => {
     $('udp-in').textContent = fmtBytes(s.udp?.rx ?? 0)
     $('seeds').textContent = fmtBytes(totalRx)
     for (const a of msg.alerts || []) {
-      // 79/80 are alert::session_log and alert::torrent_log — they fire
+      // 79/80 are alert::session_log and alert::torrent_log - they fire
       // every tick once a torrent is active and bury the interesting
       // stuff. 57 is stats. Filter from DOM but pipe to console so
       // probes can grep the wire.
@@ -77,6 +77,6 @@ $('add').addEventListener('click', () => {
   worker.postMessage({ type: 'add-magnet', magnet, savePath: '/dl' })
 })
 
-// Periodically ask the worker for status — sub-second cadence isn't useful
+// Periodically ask the worker for status - sub-second cadence isn't useful
 // here and would just generate postMessage chatter.
 setInterval(() => worker.postMessage({ type: 'poll' }), 1000)

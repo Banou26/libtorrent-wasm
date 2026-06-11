@@ -54,7 +54,7 @@
         const exports = Object.keys(inst).filter(k => k.startsWith('_lt_'))
         log('  ' + exports.length + ' _lt_ exports', 'ok')
 
-        log('STOP HERE — not calling lt_session_create yet', 'info')
+        log('STOP HERE: not calling lt_session_create yet', 'info')
       } catch (e) {
         log('FAIL: ' + (e?.stack ?? e), 'bad')
       }

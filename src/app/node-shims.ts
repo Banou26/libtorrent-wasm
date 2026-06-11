@@ -3,7 +3,7 @@
 // modules that import it). Both the main page and the worker pull this in
 // before touching @fkn/lib.
 //
-// `process.nextTick` MUST forward trailing args — readable-stream calls
+// `process.nextTick` MUST forward trailing args - readable-stream calls
 // `process.nextTick(resume_, stream, state)` and resume_ blows up with
 // 'Cannot read properties of undefined (reading "reading")' otherwise.
 
