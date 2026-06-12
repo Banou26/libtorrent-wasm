@@ -1,6 +1,6 @@
 {
   "name": "libtorrent-wasm",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "libtorrent compiled to WebAssembly, single-threaded, transport over FKN WebVPN",
   "main": "build/index.js",
   "types": "build/index.d.ts",
