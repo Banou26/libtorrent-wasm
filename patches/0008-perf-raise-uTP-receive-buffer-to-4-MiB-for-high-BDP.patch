@@ -1,0 +1,26 @@
+From e985136eef955d6e2983c0b838279ef41cdb5866 Mon Sep 17 00:00:00 2001
+From: Banou <me@banou.dev>
+Date: Sat, 13 Jun 2026 07:06:02 +0900
+Subject: [PATCH] perf: raise uTP receive buffer to 4 MiB for high-BDP relay
+ paths
+
+---
+ include/libtorrent/aux_/utp_stream.hpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/libtorrent/aux_/utp_stream.hpp b/include/libtorrent/aux_/utp_stream.hpp
+index 48b244f28..4524c8c51 100644
+--- a/include/libtorrent/aux_/utp_stream.hpp
++++ b/include/libtorrent/aux_/utp_stream.hpp
+@@ -897,7 +897,7 @@ private:
+ 	std::int32_t m_read_buffer_size = 0;
+ 
+ 	// max number of bytes to allocate for receive buffer
+-	std::int32_t m_receive_buffer_capacity = 1024 * 1024;
++	std::int32_t m_receive_buffer_capacity = 4 * 1024 * 1024;
+ 
+ 	// this holds the 3 last delay measurements,
+ 	// these are the actual corrected delay measurements.
+-- 
+2.53.0
+
