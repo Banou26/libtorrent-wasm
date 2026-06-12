@@ -308,19 +308,29 @@ LT_API int lt_session_create() {
   sp.set_int(lt::settings_pack::unchoke_slots_limit, 32);
   // The hot path is data movement, not bookkeeping. Disable the rate
   // smoothing that introduces small artificial waits.
-  // peer_proportional (not prefer_tcp): prefer_tcp *throttles* uTP to defer to
-  // TCP, but public swarms are uTP-dominant and our TCP peers are sparse - that
-  // throttle was starving the transport carrying most of the data. Share fairly.
-  sp.set_int(lt::settings_pack::mixed_mode_algorithm, lt::settings_pack::peer_proportional);
+  // prefer_tcp does NOT throttle uTP: it disables mixed-mode balancing and
+  // leaves the TCP peer class unlimited (rate limit 0 in second_tick).
+  // peer_proportional is the one that sets a rate limit, on the TCP class
+  // (webseeds included), proportional to the current total rate - with uTP
+  // collapsed on relay loss that clamped TCP to a fraction of an already
+  // broken rate. TCP rides reliable WT streams, so leave it uncapped.
+  sp.set_int(lt::settings_pack::mixed_mode_algorithm, lt::settings_pack::prefer_tcp);
   // uTP LEDBAT target delay (ms). Over the WebVPN tunnel the *constant* relay
   // latency reads as congestion at the default 100ms, collapsing cwnd to the
   // floor. Loosen it so uTP keeps the window open (the tunnel jitter, not real
   // path congestion, is what we're tolerating here).
   sp.set_int(lt::settings_pack::utp_target_delay, 600);
-  // Re-enable uTP for real-world tests - public swarms have a mix of TCP and
-  // uTP peers, and many seeders are uTP-first. prefer_tcp above already gives
-  // TCP priority when both are available. uTP path caps at ~14 MiB/s due to
-  // LEDBAT delay sensitivity but is still much better than no peer.
+  // uTP loss tolerance for the relay path: WT datagram drops arrive in bursts
+  // and are not a congestion signal from the real path, so soften the
+  // multiplicative cut and the cut cadence, keep RTOs from firing on relay
+  // jitter (an RTO resets cwnd to 1 MSS), and let established peers survive
+  // multi-second stalls instead of reconnecting back into slow start.
+  sp.set_int(lt::settings_pack::utp_loss_multiplier, 90);
+  sp.set_int(lt::settings_pack::utp_cwnd_reduce_timer, 500);
+  sp.set_int(lt::settings_pack::utp_min_timeout, 1200);
+  sp.set_int(lt::settings_pack::utp_num_resends, 8);
+  sp.set_int(lt::settings_pack::utp_syn_resends, 4);
+  sp.set_int(lt::settings_pack::utp_gain_factor, 8000);
   // DHT bootstraps via DNS to router.bittorrent.com / utorrent.com which
   // would spawn a resolver worker thread - fails hard under -sUSE_PTHREADS=0.
   // Disable for now; can be re-enabled once the JS-side DNS path is wired.
