@@ -331,10 +331,12 @@ LT_API int lt_session_create() {
   sp.set_int(lt::settings_pack::utp_num_resends, 8);
   sp.set_int(lt::settings_pack::utp_syn_resends, 4);
   sp.set_int(lt::settings_pack::utp_gain_factor, 8000);
-  // DHT bootstraps via DNS to router.bittorrent.com / utorrent.com which
-  // would spawn a resolver worker thread - fails hard under -sUSE_PTHREADS=0.
-  // Disable for now; can be re-enabled once the JS-side DNS path is wired.
-  sp.set_bool(lt::settings_pack::enable_dht, false);
+  // Bootstrap hostnames resolve through the JS DoH resolver (patch 0001:
+  // js_resolver_async -> lt_dns_complete), so no resolver thread is spawned.
+  sp.set_bool(lt::settings_pack::enable_dht, true);
+  sp.set_str(lt::settings_pack::dht_bootstrap_nodes,
+      "dht.libtorrent.org:25401,router.bittorrent.com:6881,"
+      "router.utorrent.com:6881,dht.transmissionbt.com:6881");
   // Force the disk/hashing pools to size 0 so nothing tries pthread_create.
   // Our wasm_disk_io ignores these anyway, but settings_pack init paths
   // may still touch them.
