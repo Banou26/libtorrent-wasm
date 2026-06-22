@@ -1,6 +1,6 @@
 {
   "name": "libtorrent-wasm",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "libtorrent compiled to WebAssembly, single-threaded, transport over FKN WebVPN",
   "main": "build/index.js",
   "types": "build/index.d.ts",
@@ -35,8 +35,7 @@
     "test": "playwright test"
   },
   "peerDependencies": {
-    "@webvpn/dgram": ">=0.3.0",
-    "@webvpn/net": ">=0.3.0"
+    "@fkn/lib": ">=0.5.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",

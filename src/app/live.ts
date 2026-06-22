@@ -3,8 +3,8 @@
 // everything on window for manual probing - no periodic intervals so the
 // page stays responsive for inspection.
 
-import * as net from '@webvpn/net'
-import * as dgram from '@webvpn/dgram'
+import * as net from '@fkn/lib/net'
+import * as dgram from '@fkn/lib/dgram'
 
 import factory from './libtorrent.js'
 

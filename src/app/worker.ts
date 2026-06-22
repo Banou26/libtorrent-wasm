@@ -15,8 +15,8 @@
 // pull readable-stream which dereferences `process` at module-eval time.
 import './node-shims'
 
-import * as net from '@webvpn/net'
-import * as dgram from '@webvpn/dgram'
+import * as net from '@fkn/lib/net'
+import * as dgram from '@fkn/lib/dgram'
 
 import factory from './libtorrent.js'
 import { OPFSStorage } from '../opfs'

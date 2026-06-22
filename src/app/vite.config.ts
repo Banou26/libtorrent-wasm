@@ -13,9 +13,9 @@ export default defineConfig({
   // it through as a static asset.
   assetsInclude: ['**/*.wasm'],
   optimizeDeps: {
-    // Force pre-bundling for the @webvpn polyfills and @fkn/lib so the
+    // Force pre-bundling for @fkn/lib's net/dgram subpaths and @fkn/lib so the
     // node-stdlib shims wrap them up front.
-    include: ['@webvpn/net', '@webvpn/dgram', '@fkn/lib'],
+    include: ['@fkn/lib/net', '@fkn/lib/dgram', '@fkn/lib'],
     // Don't try to optimize the wasm-side libtorrent.js (it isn't an npm
     // dep - it's the Emscripten output we pull in by relative path).
     exclude: ['libtorrent.js'],

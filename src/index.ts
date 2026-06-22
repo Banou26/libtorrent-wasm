@@ -3,8 +3,8 @@
 // Usage from a Web Worker (recommended - keeps the main thread responsive):
 //
 //   import { createSession } from 'libtorrent-wasm'
-//   import * as net from '@webvpn/net'
-//   import * as dgram from '@webvpn/dgram'
+//   import * as net from '@fkn/lib/net'
+//   import * as dgram from '@fkn/lib/dgram'
 //   import { OPFSStorage } from 'libtorrent-wasm/opfs'
 //
 //   const session = await createSession({ net, dgram, storage: new OPFSStorage() })
@@ -20,9 +20,9 @@
 import type { LtModuleFactory, LtModule, FknHost, StorageBackend } from './types'
 
 export interface SessionOptions {
-  /** @fkn/lib's net module (or @webvpn/net) */
+  /** @fkn/lib's net module (@fkn/lib/net) */
   net: any
-  /** @fkn/lib's dgram module (or @webvpn/dgram) */
+  /** @fkn/lib's dgram module (@fkn/lib/dgram) */
   dgram: any
   /** Disk backend - defaults to a no-op (download but discard). Streaming
    *  `read()` requires a backend that can read back (e.g. OPFSStorage). */
