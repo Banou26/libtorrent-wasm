@@ -120,7 +120,7 @@ addToLibrary({
       socket: 0, bind: 0, listen: 0, accept: 0, connect: 0, close: 0,
       recv: 0, recvfrom: 0, send: 0, sendto: 0,
       poll: 0, pollReady: 0, pollCalls: 0,
-      setsockopt: 0, getsockopt: 0, getsockname: 0, getpeername: 0, fcntl: 0,
+      setsockopt: 0, getsockopt: 0, getsockname: 0, getpeername: 0, fcntl: 0, ioctl: 0,
       schedule: 0, tick: 0,
       udpRx: 0, udpTx: 0, tcpRx: 0, tcpTx: 0,
       dnsReq: 0, dnsDone: 0,
@@ -1101,6 +1101,41 @@ addToLibrary({
     // / F_SETFL we only ever care about a single int - read it.
     const arg = (cmd === 4 /* F_SETFL */) ? HEAP32[varargs >> 2] : 0
     return FKN_fcntl(fd, cmd, arg)
+  },
+
+  // ioctl: Asio's select_reactor calls ioctl(fd, FIONREAD) to size its next
+  // read - per readable socket, every tick - and ioctl(fd, FIONBIO) to toggle
+  // non-blocking. FKN sockets are NOT Emscripten FS streams, so the default
+  // __syscall_ioctl's getStreamFromFD(fd) throws ErrnoError(EBADF) for every
+  // one. Constructing those exceptions (eager stack capture on SpiderMonkey)
+  // burned ~70% of the worker's CPU on Firefox with ~180 connected fds,
+  // starving the uTP tick and collapsing throughput. Handle our fds here so
+  // the hot path never throws. Non-FKN fds (stdio) aren't ioctl'd in this
+  // worker, so we mirror the BADF convention the other socket overrides use.
+  __syscall_ioctl__deps: ['$FKN'],
+  __syscall_ioctl: function(fd, op, varargs) {
+    const st = FKN.fds.get(fd)
+    if (!st) return -FKN.err.BADF
+    FKN.stats.ioctl++
+    // FIONREAD (0x541B): bytes available to read, written to the int* argp.
+    if (op === 0x541B) {
+      const avail = st.kind === 'tcp'
+        ? st.recv.total
+        : st.kind === 'udp'
+          ? (st.udpRecv.length ? st.udpRecv[0].data.length : 0)
+          : 0
+      const argp = HEAP32[varargs >> 2]
+      if (argp) HEAP32[argp >> 2] = avail
+      return 0
+    }
+    // FIONBIO (0x5421): set/clear non-blocking from the int* argp.
+    if (op === 0x5421) {
+      const argp = HEAP32[varargs >> 2]
+      st.nonblock = !!(argp ? HEAP32[argp >> 2] : 0)
+      return 0
+    }
+    // Any other ioctl on one of our sockets: no-op success, never throw.
+    return 0
   },
 
   // close and read/write must chain to the original FS-backed
