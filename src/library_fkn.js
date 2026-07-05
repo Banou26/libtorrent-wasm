@@ -1110,12 +1110,13 @@ addToLibrary({
   // one. Constructing those exceptions (eager stack capture on SpiderMonkey)
   // burned ~70% of the worker's CPU on Firefox with ~180 connected fds,
   // starving the uTP tick and collapsing throughput. Handle our fds here so
-  // the hot path never throws. Non-FKN fds (stdio) aren't ioctl'd in this
-  // worker, so we mirror the BADF convention the other socket overrides use.
+  // the hot path never throws. Non-FKN fds get BADF, except musl's first-write
+  // ioctl(1, TIOCGWINSZ) probe, which must return 0 or stdout goes fully
+  // buffered (musl only checks the return value, never the winsize struct).
   __syscall_ioctl__deps: ['$FKN'],
   __syscall_ioctl: function(fd, op, varargs) {
     const st = FKN.fds.get(fd)
-    if (!st) return -FKN.err.BADF
+    if (!st) return (fd <= 2 && op === 0x5413) ? 0 : -FKN.err.BADF
     FKN.stats.ioctl++
     // FIONREAD (0x541B): bytes available to read, written to the int* argp.
     if (op === 0x541B) {
