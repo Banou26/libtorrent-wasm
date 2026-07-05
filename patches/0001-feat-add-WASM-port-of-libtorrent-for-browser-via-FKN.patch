@@ -99,7 +99,7 @@ index 4652f8964..2ab520419 100644
  			ret.push_back(iface);
  		}
 +#elif defined __EMSCRIPTEN__
-+		// Browser environments have no enumerable interfaces — the only
++		// Browser environments have no enumerable interfaces - the only
 +		// "network" is the WebVPN tunnel held entirely on the JS side.
 +		// Returning empty lets session_impl proceed; bind paths fall back
 +		// to "any" semantics which the JS shim handles.
@@ -156,7 +156,7 @@ index 8b93bf765..f6e90dc45 100644
 +// Module.fkn.dnsLookup (which is @fkn/lib's WebVPN-tunneled DoH) when the
 +// host provides it, else falls back to a plain fetch to Cloudflare. The
 +// result arrives back via lt_dns_complete(hostname, ip_csv) on a later
-+// tick — same callback shape resolver::on_lookup uses for the Asio path.
++// tick - same callback shape resolver::on_lookup uses for the Asio path.
 +extern "C" {
 +  void js_resolver_async(char const* host, int want_v6);
 +}
@@ -201,7 +201,7 @@ index 8b93bf765..f6e90dc45 100644
 +		// supported" → session pauses). Hand the lookup off to JS instead;
 +		// JS calls Module.fkn.dnsLookup (or a fallback fetch) and posts the
 +		// result back via lt_dns_complete on a later tick. The callback in
-+		// m_callbacks stays parked until then — same shape as Asio's path.
++		// m_callbacks stays parked until then - same shape as Asio's path.
 +		js_resolver_async(host.c_str(), 0);
 +#else
  		// the port is ignored
@@ -294,7 +294,7 @@ index 41f88464e..c0fa677ec 100644
 +			// Browser: enum_net_interfaces/enum_routes both return empty (no
 +			// kernel to ask), so expand_unspecified_address would erase any
 +			// 0.0.0.0/:: entry and re-add nothing. Skip the expansion and
-+			// keep the unspecified entries — the JS-side bind() shim takes
++			// keep the unspecified entries - the JS-side bind() shim takes
 +			// "0.0.0.0" verbatim.
 +			if (!ifs.empty()) expand_unspecified_address(ifs, routes, eps);
  #else

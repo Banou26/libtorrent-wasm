@@ -12,7 +12,7 @@ index c0fa677ec..f5d6ac04d 100644
 +				// FKN's recvfrom returns WASI EAGAIN (6) for "queue empty", but
 +				// Asio's error::would_block compiles to musl EAGAIN (11), so the
 +				// values don't match. Without this the drain falls through to the
-+				// fatal-error path below and returns WITHOUT re-arming the read —
++				// fatal-error path below and returns WITHOUT re-arming the read -
 +				// inbound UDP wedges after the first batch. (11 kept for safety.)
 +				|| err.value() == 6 || err.value() == 11
 +#endif
