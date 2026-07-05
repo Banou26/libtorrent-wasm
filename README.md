@@ -3,7 +3,7 @@
 [arvidn/libtorrent](https://github.com/arvidn/libtorrent) compiled to a
 single-threaded WebAssembly module that runs in a Web Worker. Networking is
 plumbed through the [FKN WebVPN](https://github.com/Banou26/fkn) via the
-`@webvpn/net` and `@webvpn/dgram` polyfills, so a browser-hosted session can
+`@fkn/lib/net` and `@fkn/lib/dgram` polyfills, so a browser-hosted session can
 talk real TCP and uTP to internet peers.
 
 ## Layout

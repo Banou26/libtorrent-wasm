@@ -1,4 +1,4 @@
-// Live integration: real @webvpn/net + dgram via @fkn/lib's iframe to
+// Live integration: real @fkn/lib/net + dgram via @fkn/lib's iframe to
 // http://localhost:1234/api. Bootstraps the WASM session and exposes
 // everything on window for manual probing - no periodic intervals so the
 // page stays responsive for inspection.

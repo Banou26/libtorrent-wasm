@@ -10,7 +10,7 @@ const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'modu
 
 // Wait one tick for the auto-injected iframe's contentWindow to attach,
 // then bridge osra messages between the iframe and the worker. Without
-// this the worker's @webvpn/{net,dgram} calls have no transport.
+// this the worker's @fkn/lib/{net,dgram} calls have no transport.
 setTimeout(() => {
   try { relayWorker(worker) }
   catch (e) { console.error('relayWorker failed:', e) }

@@ -1,4 +1,4 @@
-// libtorrent + @fkn/lib's @webvpn/{net,dgram} running in a Web Worker.
+// libtorrent + @fkn/lib's net/dgram running in a Web Worker.
 //
 // Why: when libtorrent lived on the main thread, every WebVPN UDP datagram
 // went through the @fkn/lib iframe → main-thread postMessage → my JS shim,
@@ -11,7 +11,7 @@
 //     can call net/dgram transparently.
 
 // Node-stdlib shims (global, process). Imported separately so it runs
-// BEFORE the hoisted @webvpn/{net,dgram} imports - those transitively
+// BEFORE the hoisted @fkn/lib/{net,dgram} imports - those transitively
 // pull readable-stream which dereferences `process` at module-eval time.
 import './node-shims'
 

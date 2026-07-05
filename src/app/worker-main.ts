@@ -3,7 +3,7 @@
 // Responsibilities here are tiny:
 //   1. Importing @fkn/lib auto-creates the hidden iframe to fkn/web's /api.
 //   2. relayWorker(worker) forwards osra messages between iframe and worker
-//      so the worker's `@webvpn/{net,dgram}` work transparently.
+//      so the worker's `@fkn/lib/{net,dgram}` work transparently.
 //   3. UI plumbing: button → postMessage to worker, worker → DOM updates.
 
 import { relayWorker } from '@fkn/lib'
