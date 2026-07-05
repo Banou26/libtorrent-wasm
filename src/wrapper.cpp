@@ -54,6 +54,7 @@ extern "C" int __syscall_setsockopt(int /*fd*/, int /*level*/, int /*optname*/,
 #include "libtorrent/write_resume_data.hpp"
 #include "libtorrent/read_resume_data.hpp"
 #include "libtorrent/session_handle.hpp"
+#include "libtorrent/aux_/utp_stream.hpp"
 
 #include "disk_io.hpp"
 
@@ -256,6 +257,11 @@ void emit_resume_data(lt::save_resume_data_alert const* a) {
 } // namespace
 
 // ---- session lifecycle -----------------------------------------------------
+
+// Call before lt_session_create(); sockets read it at construction.
+LT_API void lt_set_utp_receive_buffer(std::int32_t bytes) {
+  if (bytes > 0) lt::aux::utp_receive_buffer_capacity = bytes;
+}
 
 LT_API int lt_session_create() {
   if (g_session) return -1;

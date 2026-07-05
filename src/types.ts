@@ -11,6 +11,7 @@ export interface LtModule {
   stringToNewUTF8(s: string): number
   UTF8ToString(ptr: number, maxBytes?: number): string
 
+  _lt_set_utp_receive_buffer(bytes: number): void
   _lt_session_create(): number
   _lt_session_destroy(): void
   _lt_session_tick(): void

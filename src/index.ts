@@ -31,6 +31,8 @@ export interface SessionOptions {
   moduleFactory?: LtModuleFactory
   /** Fallback tick interval in ms - used when nothing else pumps */
   tickIntervalMs?: number
+  /** Per-socket uTP receive buffer capacity in bytes - defaults to 1 MiB */
+  utpReceiveBufferBytes?: number
 }
 
 // torrent_status state_t (TORRENT_ABI_VERSION 3). Only these values occur.
@@ -116,6 +118,7 @@ export class Session {
   constructor(mod: LtModule, options: SessionOptions) {
     this.mod = mod
     this.storage = options.storage ?? null
+    if (options.utpReceiveBufferBytes) mod._lt_set_utp_receive_buffer(options.utpReceiveBufferBytes)
     if (mod._lt_session_create() !== 0) {
       throw new Error('lt_session_create returned non-zero')
     }

@@ -1,0 +1,37 @@
+From 39c7402a3dd530b096be3b999c4c624e0b81da76 Mon Sep 17 00:00:00 2001
+From: Banou <me@banou.dev>
+Date: Mon, 6 Jul 2026 01:29:50 +0900
+Subject: [PATCH] perf: make uTP receive buffer capacity a session-global
+ runtime knob
+
+---
+ include/libtorrent/aux_/utp_stream.hpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/include/libtorrent/aux_/utp_stream.hpp b/include/libtorrent/aux_/utp_stream.hpp
+index 48b244f28..7a0e026bc 100644
+--- a/include/libtorrent/aux_/utp_stream.hpp
++++ b/include/libtorrent/aux_/utp_stream.hpp
+@@ -79,6 +79,10 @@ namespace aux {
+ 	TORRENT_EXTRA_EXPORT bool compare_less_wrap(std::uint32_t lhs
+ 		, std::uint32_t rhs, std::uint32_t mask);
+ 
++	// session-global initial receive buffer capacity (and advertised receive
++	// window) picked up by every uTP socket constructed after it is set
++	inline std::int32_t utp_receive_buffer_capacity = 1024 * 1024;
++
+ 	struct utp_socket_manager;
+ 
+ 	// internal: the point of the bif_endian_int is two-fold
+@@ -897,7 +901,7 @@ private:
+ 	std::int32_t m_read_buffer_size = 0;
+ 
+ 	// max number of bytes to allocate for receive buffer
+-	std::int32_t m_receive_buffer_capacity = 1024 * 1024;
++	std::int32_t m_receive_buffer_capacity = utp_receive_buffer_capacity;
+ 
+ 	// this holds the 3 last delay measurements,
+ 	// these are the actual corrected delay measurements.
+-- 
+2.53.0
+
