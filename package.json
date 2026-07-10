@@ -27,8 +27,8 @@
     "dev-wasm": "nodemon -e cpp,hpp,js --watch src --exec \"npm run make-docker\"",
     "make-docker": "docker compose run --rm libtorrent-wasm make dist",
     "docker-clean": "docker compose up --remove-orphans",
-    "vite-build": "vite build",
-    "vite-build-dev": "vite build --watch",
+    "vite-build": "vp build",
+    "vite-build-dev": "vp build --watch",
     "build": "npm run make-docker && npm run vite-build && npm run types && npm run copy-wasm",
     "types": "tsc",
     "copy-wasm": "copyfiles -u 1 dist/libtorrent.js dist/libtorrent.wasm build",
@@ -45,6 +45,17 @@
     "nodemon": "^2.0.22",
     "playwright": "^1.60.0",
     "typescript": "^5.7.3",
-    "vite": "^6.1.0"
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.2.4",
+    "vite-plus": "0.2.4"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "npm",
+      "version": "12.0.1",
+      "onFail": "download"
+    }
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.2.4"
   }
 }
