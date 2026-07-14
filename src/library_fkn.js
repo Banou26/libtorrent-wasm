@@ -39,7 +39,7 @@ addToLibrary({
   // data members - a live `new Map()` in the literal below becomes `{}`, so the
   // fd table loses `.has`/`.set`/`.get`. Re-create it as a real Map in a postset
   // (emitted verbatim after `var FKN = {…}`, before any socket syscall runs).
-  $FKN__postset: 'FKN.fds = new Map();',
+  $FKN__postset: 'FKN.fds = new Map(); FKN.freeFds = [];',
   $FKN: {
     initialized: false,
 
@@ -61,6 +61,7 @@ addToLibrary({
       INPROGRESS: 26,
       INVAL: 28,
       IO: 29,
+      MFILE: 33,
       NOTCONN: 53,
       NOTSOCK: 57,
       TIMEDOUT: 73,
@@ -72,6 +73,7 @@ addToLibrary({
     // allocate before we take over.
     nextFd: 16,
     fds: null, // real Map assigned in $FKN__postset (see note above)
+    freeFds: null,
 
     // Tick scheduler: requested from JS callbacks when something becomes
     // ready that the C side hasn't seen yet.
@@ -149,7 +151,13 @@ addToLibrary({
     //     writable: true,
     //   }
     newFd(state) {
-      const fd = FKN.nextFd++
+      const fd = FKN.freeFds.length
+        ? FKN.freeFds.pop()
+        : FKN.nextFd < 1024 ? FKN.nextFd++ : -1
+      if (fd < 0) {
+        FKN.closeState(state)
+        return -FKN.err.MFILE
+      }
       state.error = 0
       state.recv = state.recv || { chunks: [], total: 0, fin: false, error: 0 }
       state.writable = true
@@ -157,14 +165,20 @@ addToLibrary({
       return fd
     },
 
+    closeState(state) {
+      try {
+        if (state.socket?.destroy) state.socket.destroy()
+        else if (state.socket?.close) state.socket.close()
+        if (state.server) state.server.close()
+      } catch (e) { /* ignore - already gone */ }
+    },
+
     closeFd(fd) {
       const s = FKN.fds.get(fd)
       if (!s) return
-      try {
-        if (s.socket) s.socket.destroy()
-        if (s.server) s.server.close()
-      } catch (e) { /* ignore - already gone */ }
       FKN.fds.delete(fd)
+      if (fd >= 16 && fd < 1024) FKN.freeFds.push(fd)
+      FKN.closeState(s)
     },
 
     init() {
@@ -1193,6 +1207,19 @@ addToLibrary({
         finish(ips.join(','))
       })
       .catch(() => finish(''))
+  },
+
+  fd_close__deps: ['$FKN', '$FKN_close', '$FS', '$SYSCALLS'],
+  fd_close: function(fd) {
+    if (FKN.fds.has(fd)) return FKN_close(fd)
+    try {
+      const stream = SYSCALLS.getStreamFromFD(fd)
+      FS.close(stream)
+      return 0
+    } catch (e) {
+      if (typeof FS === 'undefined' || e.name !== 'ErrnoError') throw e
+      return e.errno
+    }
   },
 
   __syscall_close__deps: ['$FKN', '$FKN_close'],

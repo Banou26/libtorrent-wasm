@@ -32,7 +32,8 @@
     "build": "npm run make-docker && npm run vite-build && npm run types && npm run copy-wasm",
     "types": "tsc",
     "copy-wasm": "copyfiles -u 1 dist/libtorrent.js dist/libtorrent.wasm build",
-    "test": "playwright test"
+    "test": "playwright test",
+    "test:fd-lifecycle": "node scripts/test-fd-lifecycle.mjs"
   },
   "peerDependencies": {
     "@fkn/lib": ">=0.5.0"

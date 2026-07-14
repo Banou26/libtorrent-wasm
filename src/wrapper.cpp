@@ -304,7 +304,10 @@ LT_API int lt_session_create() {
   // outstanding_request_limit_reached performance warning right before
   // peers got "snubbed" because we couldn't keep them fed. Lift it.
   sp.set_int(lt::settings_pack::max_out_request_queue, 5000);
-  sp.set_int(lt::settings_pack::connections_limit, 500);
+  // The single-threaded WASM reactor services every socket in one worker.
+  // Keep the peer set below the relay session budget and bound each reactor
+  // pass, especially on Firefox where large ready sets stall the worker.
+  sp.set_int(lt::settings_pack::connections_limit, 64);
   // Keep peers from being declared "snubbed" while we're processing a
   // burst - defaults assume ~100ms response latency; our JS tick chain
   // can stretch that under heavy load.
@@ -518,9 +521,8 @@ LT_API int lt_diag_parse_interfaces(char const* str) {
 // between batches; the JS side rearms scheduleTick when this returns the
 // budget cap (meaning more work likely waiting).
 //
-// Drain handlers in a time-budgeted loop: keep calling poll() (which
-// processes all currently-ready handlers in one shot) as long as more
-// work appears, capped at ~8ms to leave the renderer breathing room.
+// Drain handlers in a time-budgeted loop. poll_one() returns after each
+// handler so the deadline is enforceable even when the ready queue is large.
 // Without the loop, work that becomes ready DURING the tick (e.g. a
 // handler that posts another handler) has to wait a full JS task round-
 // trip to be picked up. Browser task rate is ~150-200/sec under load
@@ -535,16 +537,11 @@ LT_API int lt_session_tick() {
   std::size_t ran = 0;
   try {
     auto const start = std::chrono::steady_clock::now();
-    // Worker variant: libtorrent runs in a dedicated Worker, so the
-    // renderer never sees this tick. The only thing it shares time with
-    // is the @fkn/lib dgram socket's 'message' handler. A 100 ms cap is
-    // generous enough to let libtorrent burn down a full burst of
-    // pending blocks without ping-pong; smaller budgets bounce control
-    // back to JS between tiny batches, capping throughput well below
-    // what the network is feeding us.
-    auto const deadline = start + std::chrono::milliseconds(100);
+    // Yield frequently enough for WebSocket and datagram message tasks to
+    // feed the reactor. scheduleTick() immediately rearms when work remains.
+    auto const deadline = start + std::chrono::milliseconds(8);
     while (true) {
-      std::size_t const n = g_session->ioc->poll();
+      std::size_t const n = g_session->ioc->poll_one();
       ran += n;
       if (n == 0) break;
       if (std::chrono::steady_clock::now() > deadline) break;
