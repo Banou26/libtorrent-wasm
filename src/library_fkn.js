@@ -42,6 +42,9 @@ addToLibrary({
   $FKN__postset: 'FKN.fds = new Map(); FKN.freeFds = [];',
   $FKN: {
     initialized: false,
+    // Set from Module.fkn.debug at init. Declared here so a trace that runs before init
+    // (there is one, in socket()) reads false rather than undefined.
+    debug: false,
 
     // Emscripten uses WASI errno values, NOT Linux's. The differences
     // *matter*: returning Linux EINPROGRESS (115) from connect() makes
@@ -271,11 +274,15 @@ addToLibrary({
 
     init() {
       if (FKN.initialized) return
-      console.log('[FKN] init')
       const host = Module.fkn
       if (!host || !host.net || !host.dgram) {
         throw new Error('Module.fkn = { net, dgram, storage } must be set before _lt_session_create()')
       }
+      // Off unless the host asks for it. These traces run to hundreds of lines a minute on
+      // an ordinary download, which is fine while working on the transport and pure noise in
+      // anyone else's console.
+      FKN.debug = !!host.debug
+      if (FKN.debug) console.log('[FKN] init')
       FKN.host = host
       FKN.net = host.net
       FKN.dgram = host.dgram
@@ -347,8 +354,8 @@ addToLibrary({
   // ---- socket lifecycle --------------------------------------------------
   $FKN_socket__deps: ['$FKN'],
   $FKN_socket(domain, type) {
-    if (typeof console !== 'undefined') console.log('[FKN] socket(domain=' + domain + ', type=' + type + ')')
     FKN.init()
+    if (FKN.debug) console.log('[FKN] socket(domain=' + domain + ', type=' + type + ')')
     // SOCK_STREAM = 1, SOCK_DGRAM = 2 (Linux values; Emscripten matches)
     const SOCK_TYPE = type & 0xf
     const family = domain === 10 ? 'IPv6' : 'IPv4'
@@ -371,7 +378,7 @@ addToLibrary({
       // whether the iframe→worker osra path is dropping anything.
       FKN._dbgWorkerUdpPkts = FKN._dbgWorkerUdpPkts || 0
       FKN._dbgWorkerUdpBytes = FKN._dbgWorkerUdpBytes || 0
-      if (!FKN._dbgWorkerUdpStarted) {
+      if (FKN.debug && !FKN._dbgWorkerUdpStarted) {
         FKN._dbgWorkerUdpStarted = true
         setInterval(() => {
           if (FKN._dbgWorkerUdpPkts || FKN._dbgWorkerUdpBytes) {
@@ -382,7 +389,7 @@ addToLibrary({
         }, 1000)
       }
       // Init JS-busy counter
-      if (!FKN._dbgJsBusyStarted) {
+      if (FKN.debug && !FKN._dbgJsBusyStarted) {
         FKN._dbgJsBusyStarted = true
         FKN._dbgJsBusyUs = 0
         FKN._dbgJsHandlerCalls = 0
@@ -465,7 +472,7 @@ addToLibrary({
   // ---- TCP bind + listen + accept ----------------------------------------
   $FKN_bind__deps: ['$FKN'],
   $FKN_bind(fd, addrPtr, addrLen) {
-    console.log('[FKN] bind(fd=' + fd + ')')
+    if (FKN.debug) console.log('[FKN] bind(fd=' + fd + ')')
     const st = FKN.fds.get(fd)
     if (!st) return -FKN.err.BADF
     const ep = FKN.readSockaddr(addrPtr, addrLen)
@@ -496,7 +503,7 @@ addToLibrary({
 
   $FKN_listen__deps: ['$FKN'],
   $FKN_listen(fd /*, backlog */) {
-    console.log('[FKN] listen(fd=' + fd + ')')
+    if (FKN.debug) console.log('[FKN] listen(fd=' + fd + ')')
     const st = FKN.fds.get(fd)
     if (!st || st.kind !== 'tcp-unbound') return -FKN.err.INVAL
     const server = FKN.net.createServer()

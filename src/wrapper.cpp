@@ -58,14 +58,21 @@ extern "C" int __syscall_setsockopt(int /*fd*/, int /*level*/, int /*optname*/,
 
 #include "disk_io.hpp"
 
+// Traces are off unless the host turns them on. The per-second tick counter alone is a line
+// a second for the life of the session, which belongs in a console someone is deliberately
+// watching rather than in every user's.
+static bool g_log_enabled = false;
+
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #define LT_API extern "C" EMSCRIPTEN_KEEPALIVE
-#define LT_LOG(msg) emscripten_log(EM_LOG_CONSOLE, "%s", msg)
+#define LT_LOG(msg) do { if (g_log_enabled) emscripten_log(EM_LOG_CONSOLE, "%s", msg); } while (0)
 #else
 #define LT_API extern "C"
 #define LT_LOG(msg) ((void)0)
 #endif
+
+LT_API void lt_set_log(int on) { g_log_enabled = on != 0; }
 
 namespace {
 

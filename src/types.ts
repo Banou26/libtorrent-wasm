@@ -30,6 +30,7 @@ export interface LtModule {
   _lt_torrent_pause(handle: number): number
   _lt_torrent_resume(handle: number): number
   _lt_torrent_force_recheck(handle: number): number
+  _lt_set_log(on: number): void
   _lt_torrent_save_resume_data(handle: number): number
 
   _lt_torrent_status(handle: number, out: number): number
@@ -50,6 +51,9 @@ export interface FknHost {
   net: any
   dgram: any
   storage: StorageBackend | null
+  /** Turn on the transport and tick traces. Off by default: they run to hundreds of
+   *  lines a minute on an ordinary download. */
+  debug?: boolean
   /**
    * Optional. When supplied, the WASM resolver routes DNS lookups through
    * this function (typically @fkn/lib's dnsLookup, which tunnels via

@@ -33,6 +33,10 @@ export interface SessionOptions {
   tickIntervalMs?: number
   /** Per-socket uTP receive buffer capacity in bytes - defaults to 1 MiB */
   utpReceiveBufferBytes?: number
+  /** Print the transport and tick traces. Off by default: on an ordinary download they
+   *  run to several hundred console lines a minute, which is useful while working on the
+   *  transport and noise everywhere else. */
+  debug?: boolean
 }
 
 // torrent_status state_t (TORRENT_ABI_VERSION 3). Only these values occur.
@@ -471,7 +475,11 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     net: options.net,
     dgram: options.dgram,
     storage: options.storage ?? null,
+    debug: options.debug ?? false,
   }
   const mod: LtModule = await factory({ fkn: host })
+  // Before the Session constructor, which creates the session and is itself one of the
+  // things that traces.
+  mod._lt_set_log(options.debug ? 1 : 0)
   return new Session(mod, options)
 }
