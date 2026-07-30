@@ -178,7 +178,95 @@ addToLibrary({
       if (!s) return
       FKN.fds.delete(fd)
       if (fd >= 16 && fd < 1024) FKN.freeFds.push(fd)
+      // Marked before tearing it down, so the close handler reads this as the fd
+      // going away rather than an outage worth reopening for.
+      s.closed = true
       FKN.closeState(s)
+    },
+
+    // ---- UDP socket lifecycle ----------------------------------------------
+    // The datagram socket under a udp fd does not survive losing the connection:
+    // the tunnel drops it, and from that moment sends go nowhere and no packet
+    // ever arrives again. Nothing above notices, because a dead socket still
+    // accepts send() without complaint and an empty receive queue is
+    // indistinguishable from a quiet one. DHT, UDP trackers and uTP all stop
+    // while the session reports itself perfectly healthy.
+    //
+    // libtorrent cannot fix this: it holds the fd, not the socket. So the fd
+    // keeps its identity and the socket underneath is replaced, re-bound to the
+    // same local port. Everything above the shim carries on unaware.
+    UDP_REOPEN_DELAYS: [250, 1000, 3000, 10000, 30000],
+
+    attachUdp(st) {
+      const sock = FKN.dgram.createSocket({ type: st.family === 'IPv6' ? 'udp6' : 'udp4' })
+      st.socket = sock
+      st.dead = false
+
+      sock.on('message', (data, rinfo) => {
+        const _t0 = performance.now()
+        FKN._dbgWorkerUdpPkts++
+        FKN._dbgWorkerUdpBytes += data.length || data.byteLength || 0
+        // CRITICAL: copy the buffer. @fkn/lib's WebTransport datagram reader
+        // re-uses backing buffers across reads - if we stash the original
+        // Uint8Array reference, by the time C++ drains it on the next tick
+        // the bytes have been overwritten by a later datagram. That
+        // corruption manifests as hash-piece-failed alerts and instant
+        // peer bans; tens of MB of bandwidth wasted per second.
+        const src = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data)
+        const copy = new Uint8Array(src.length)
+        copy.set(src)
+        st.udpRecv.push({
+          data: copy,
+          address: rinfo.address, port: rinfo.port, family: rinfo.family,
+        })
+        // Traffic is flowing again, so the next outage starts from the short delay.
+        st.reopenAttempts = 0
+        FKN.scheduleTick()
+        FKN._dbgJsBusyUs += (performance.now() - _t0) * 1000
+        FKN._dbgJsHandlerCalls++
+      })
+      sock.on('error', (err) => {
+        st.error = err.errno || FKN.err.IO
+        FKN.reopenUdp(st, 'error')
+      })
+      // A dropped tunnel usually looks like a clean close rather than an error,
+      // which is why watching only 'error' left the socket silently dead.
+      sock.on('close', () => FKN.reopenUdp(st, 'close'))
+      sock.on('listening', () => {
+        const a = sock.address()
+        st.localAddr = a.address; st.localPort = a.port; st.localFamily = a.family
+      })
+
+      // A replacement has to land back on the port the session announced, or
+      // every peer that already has our endpoint is talking to nobody.
+      if (st.bound) {
+        try { sock.bind(st.localPort, st.localAddr) }
+        catch (e) { FKN.reopenUdp(st, 'bind') }
+      }
+      return sock
+    },
+
+    reopenUdp(st, why) {
+      if (st.closed || st.reopening) return
+      st.dead = true
+      st.reopening = true
+      FKN.stats.udpReopen = (FKN.stats.udpReopen || 0) + 1
+      const attempt = st.reopenAttempts || 0
+      st.reopenAttempts = attempt + 1
+      const delay = FKN.UDP_REOPEN_DELAYS[Math.min(attempt, FKN.UDP_REOPEN_DELAYS.length - 1)]
+      console.warn('[FKN] udp socket ' + why + ', reopening in ' + delay + 'ms (attempt ' + st.reopenAttempts + ')')
+      setTimeout(() => {
+        st.reopening = false
+        if (st.closed) return
+        try { st.socket?.close?.() } catch (e) { /* already gone */ }
+        try {
+          FKN.attachUdp(st)
+          FKN.scheduleTick()
+        } catch (e) {
+          // Keep trying: the tunnel itself may still be coming back.
+          FKN.reopenUdp(st, 'reopen-failed')
+        }
+      }, delay)
     },
 
     init() {
@@ -274,10 +362,9 @@ addToLibrary({
       return fd
     }
     if (SOCK_TYPE === 2) {
-      const sock = FKN.dgram.createSocket({ type: family === 'IPv6' ? 'udp6' : 'udp4' })
       const st = {
         kind: 'udp', family, nonblock: false,
-        socket: sock, udpRecv: [],
+        socket: null, udpRecv: [], reopenAttempts: 0,
       }
       // Per-second packet rate / byte rate counter on the worker side of
       // the cross-realm hop. Diff against the iframe-side counter to see
@@ -309,35 +396,7 @@ addToLibrary({
           FKN._dbgJsHandlerCalls = 0
         }, 1000)
       }
-      sock.on('message', (data, rinfo) => {
-        const _t0 = performance.now()
-        FKN._dbgWorkerUdpPkts++
-        FKN._dbgWorkerUdpBytes += data.length || data.byteLength || 0
-        // CRITICAL: copy the buffer. @fkn/lib's WebTransport datagram reader
-        // re-uses backing buffers across reads - if we stash the original
-        // Uint8Array reference, by the time C++ drains it on the next tick
-        // the bytes have been overwritten by a later datagram. That
-        // corruption manifests as hash-piece-failed alerts and instant
-        // peer bans; tens of MB of bandwidth wasted per second.
-        const src = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data)
-        const copy = new Uint8Array(src.length)
-        copy.set(src)
-        st.udpRecv.push({
-          data: copy,
-          address: rinfo.address, port: rinfo.port, family: rinfo.family,
-        })
-        FKN.scheduleTick()
-        FKN._dbgJsBusyUs += (performance.now() - _t0) * 1000
-        FKN._dbgJsHandlerCalls++
-      })
-      sock.on('error', (err) => {
-        st.error = err.errno || FKN.err.IO
-        FKN.scheduleTick()
-      })
-      sock.on('listening', () => {
-        const a = sock.address()
-        st.localAddr = a.address; st.localPort = a.port; st.localFamily = a.family
-      })
+      FKN.attachUdp(st)
       return FKN.newFd(st)
     }
     return -FKN.err.INVAL
@@ -414,6 +473,9 @@ addToLibrary({
     if (st.kind === 'udp') {
       st.socket.bind(ep.port, ep.address)
       st.localAddr = ep.address; st.localPort = ep.port; st.localFamily = ep.family
+      // Remembered so a socket replaced after an outage returns to the same
+      // endpoint, which is the one every peer and tracker already has.
+      st.bound = true
       return 0
     }
     if (st.kind === 'tcp-unbound') {
@@ -592,8 +654,21 @@ addToLibrary({
           ? { address: st.remoteAddr, port: st.remotePort, family: st.remoteFamily }
           : null)
     if (!ep) return -FKN.err.INVAL
+    // Reporting a send as delivered over a socket that is gone is what made the
+    // failure invisible: the engine believed every packet left and simply waited
+    // forever for replies. EAGAIN is the honest answer while the socket is being
+    // replaced, and it is one the caller already knows how to handle.
+    if (st.dead || !st.socket) {
+      FKN.reopenUdp(st, 'send-on-dead')
+      return -FKN.err.AGAIN
+    }
     const chunk = HEAPU8.slice(bufPtr, bufPtr + len)
-    st.socket.send(chunk, 0, len, ep.port, ep.address)
+    try {
+      st.socket.send(chunk, 0, len, ep.port, ep.address)
+    } catch (e) {
+      FKN.reopenUdp(st, 'send-threw')
+      return -FKN.err.AGAIN
+    }
     FKN.stats.udpTx += len
     return len
   },
