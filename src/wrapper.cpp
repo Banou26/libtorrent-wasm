@@ -747,6 +747,21 @@ LT_API int lt_torrent_resume(std::uint32_t id) {
   return 0;
 }
 
+// Re-verify every piece against what is actually on disk, for when the files and the
+// recorded have-set have drifted apart. libtorrent forgets the have-set first and only
+// schedules the hash pass for a torrent that is neither paused nor errored
+// (should_check_files), so clearing both is what makes the check run rather than sit. It
+// reports progress through the usual status updates while state is checking_files.
+LT_API int lt_torrent_force_recheck(std::uint32_t id) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h) return -1;
+  h->set_flags(lt::torrent_flags::auto_managed);
+  h->resume();
+  h->force_recheck();
+  return 0;
+}
+
 // Ask libtorrent to snapshot fast-resume state; arrives async as a
 // save_resume_data_alert → REC_RESUME_DATA. save_info_dict embeds the metadata.
 LT_API int lt_torrent_save_resume_data(std::uint32_t id) {

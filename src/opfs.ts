@@ -19,19 +19,38 @@ interface StorageEntry {
   fileMeta: Array<{ path: string; size: number }>
 }
 
+// libtorrent's status_t (storage_defs.hpp), as returned by check().
+export const STORAGE_NO_ERROR = 0
+export const STORAGE_NEED_FULL_CHECK = 2
+
 export class OPFSStorage implements StorageBackend {
   private storages = new Map<number, StorageEntry>()
+  // In-flight onNewStorage calls. libtorrent asks for a check from inside the same
+  // synchronous pass that creates the storage (torrent::init constructs it and then calls
+  // async_check_files without yielding), so check() can run before the entry exists.
+  private opened = new Map<number, Promise<void>>()
 
-  async onNewStorage(id: number, savePath: string, files: Array<{ path: string; size: number }>) {
-    const root = await navigator.storage.getDirectory()
-    // Mirror savePath into OPFS: stripping any leading slash, otherwise
-    // getDirectoryHandle complains.
-    const cleanPath = savePath.replace(/^\/+/, '')
-    const rootDir = await ensureDirRecursive(root, cleanPath)
-    this.storages.set(id, { rootDir, files: new Map(), opening: new Map(), fileMeta: files })
+  onNewStorage(id: number, savePath: string, files: Array<{ path: string; size: number }>): Promise<void> {
+    const open = (async () => {
+      const root = await navigator.storage.getDirectory()
+      // Mirror savePath into OPFS: stripping any leading slash, otherwise
+      // getDirectoryHandle complains.
+      const cleanPath = savePath.replace(/^\/+/, '')
+      const rootDir = await ensureDirRecursive(root, cleanPath)
+      this.storages.set(id, { rootDir, files: new Map(), opening: new Map(), fileMeta: files })
+    })()
+    this.opened.set(id, open)
+    // Forgotten on success only. A failed open has to stay visible, or check() cannot tell
+    // "looked, and there is nothing there" from "never got to look".
+    void open.then(
+      () => { if (this.opened.get(id) === open) this.opened.delete(id) },
+      () => {},
+    )
+    return open
   }
 
   async onRemoveStorage(id: number) {
+    this.opened.delete(id)
     const e = this.storages.get(id)
     if (!e) return
     for (const h of e.files.values()) {
@@ -101,9 +120,48 @@ export class OPFSStorage implements StorageBackend {
     return this.release(id)
   }
 
-  async check(_id: number): Promise<number> {
-    // 0 = status_t::no_error. The session will re-hash to verify.
-    return 0
+  // What libtorrent's own backends answer when they have no resume data to go on: both
+  // posix_disk_io and mmap_disk_io return need_full_check if any file holds bytes and
+  // no_error if none do. no_error means "trust what you have", NOT "verify", so answering
+  // it unconditionally (as this used to) turned force_recheck - which forgets every piece
+  // before asking - into a full re-download, and made a restore without a resume blob
+  // re-fetch data that was sitting on disk.
+  //
+  // Existence, not size: a partially downloaded file is legitimately shorter than the
+  // torrent declares. Zero-length counts as absent because openFile creates files on
+  // demand, so a torrent that was only ever read from leaves empty ones behind.
+  async check(id: number): Promise<number> {
+    let openFailed = false
+    await this.opened.get(id)?.catch(() => { openFailed = true })
+    // The storage never opened, so what is on disk is genuinely unknown rather than known
+    // to be nothing, and the two answers are not equally wrong.
+    if (openFailed) return STORAGE_NEED_FULL_CHECK
+    const e = this.storages.get(id)
+    if (!e) return STORAGE_NO_ERROR
+    // getFile() takes a shared lock that a cached SyncAccessHandle holds exclusively.
+    // Nothing is open on the add path, and force_recheck releases first, so this only
+    // guards the ordering rather than costing a live torrent its handles.
+    await this.release(id)
+    for (const meta of e.fileMeta) {
+      if (await this.hasBytes(e, meta.path)) return STORAGE_NEED_FULL_CHECK
+    }
+    return STORAGE_NO_ERROR
+  }
+
+  private async hasBytes(e: StorageEntry, path: string): Promise<boolean> {
+    const segments = path.split('/').filter(Boolean)
+    const name = segments.pop()
+    if (!name) return false
+    let dir = e.rootDir
+    try {
+      for (const s of segments) dir = await dir.getDirectoryHandle(s)
+      return (await (await dir.getFileHandle(name)).getFile()).size > 0
+    } catch (err) {
+      // Not being there is the ordinary answer for a torrent that has not written yet.
+      // Anything else leaves the file's state unknown, and verifying an intact torrent
+      // costs time where trusting a broken one costs the download.
+      return (err as { name?: string })?.name !== 'NotFoundError'
+    }
   }
 
   async deleteFiles(id: number, _flags: number): Promise<void> {

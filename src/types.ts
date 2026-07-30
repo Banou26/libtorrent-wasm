@@ -29,6 +29,7 @@ export interface LtModule {
 
   _lt_torrent_pause(handle: number): number
   _lt_torrent_resume(handle: number): number
+  _lt_torrent_force_recheck(handle: number): number
   _lt_torrent_save_resume_data(handle: number): number
 
   _lt_torrent_status(handle: number, out: number): number

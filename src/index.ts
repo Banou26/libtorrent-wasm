@@ -189,6 +189,16 @@ export class Session {
   pauseTorrent(handle: number) { this.mod._lt_torrent_pause(handle) }
   resumeTorrent(handle: number) { this.mod._lt_torrent_resume(handle) }
 
+  /**
+   * Re-verify every piece against the bytes on disk, for when the files and the recorded
+   * have-set have drifted apart. The torrent forgets what it has first, so any saved
+   * resume blob for it is stale from this point and should be discarded. It reports
+   * through the usual status updates, with `state` at checkingResumeData then
+   * checkingFiles and `progress` tracking the check rather than the download. A paused or
+   * errored torrent cannot be scheduled for a check, so this clears both.
+   */
+  forceRecheck(handle: number) { this.mod._lt_torrent_force_recheck(handle) }
+
   // Snapshot fast-resume state. Resolves with the bencoded blob once libtorrent
   // posts it (async). Rejects after a timeout so callers can't hang forever.
   saveResumeData(handle: number, timeoutMs = 8000): Promise<Uint8Array> {
