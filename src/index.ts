@@ -58,6 +58,19 @@ export interface TorrentStatus {
   numPiecesHave: number
   hasMetadata: boolean
   paused: boolean
+  /**
+   * Still in libtorrent's own rotation. It stops whatever sits past active_downloads /
+   * active_seeds and starts it again once a slot frees, so a paused torrent that is still
+   * auto-managed and has no error is queued, not broken. The flag survives an error, so
+   * read it together with `errorCode` rather than on its own.
+   */
+  autoManaged: boolean
+  /** Position in the download queue, or -1 for a seeding or finished torrent. */
+  queuePosition: number
+  /** libtorrent's error_code value for this torrent, 0 when it has no error. */
+  errorCode: number
+  /** The matching message, empty when there is no error. */
+  error: string
 }
 
 export interface FileEntry {
@@ -91,6 +104,8 @@ export interface Alert {
 
 // Binary record ids the wrapper appends to the alert stream (see wrapper.cpp).
 // Chosen to avoid real libtorrent alert ids and the 0xFFFFFFFx sentinels.
+const utf8 = new TextDecoder()
+
 const REC_TORRENT_READY = 0xf0000001
 const REC_STATE_UPDATE = 0xf0000002
 const REC_READ_PIECE = 0xf0000003
@@ -383,6 +398,16 @@ export class Session {
     const numPeers = view.getInt32(off, true); off += 4
     const numSeeds = view.getInt32(off, true); off += 4
     const paused = view.getUint32(off, true) !== 0; off += 4
+    const autoManaged = view.getUint32(off, true) !== 0; off += 4
+    const queuePosition = view.getInt32(off, true); off += 4
+    const errorCode = view.getInt32(off, true); off += 4
+    const errorLen = view.getUint32(off, true); off += 4
+    // Decoding only when there is something to decode: this runs for every torrent on
+    // every tick, and the string is empty in all but the failing case.
+    const error = errorLen
+      ? utf8.decode(new Uint8Array(view.buffer, view.byteOffset + off, errorLen))
+      : ''
+    off += errorLen
     const numPiecesTotal = view.getUint32(off, true); off += 4
     const bitfieldBytes = view.getUint32(off, true); off += 4
     // Copy out of the heap (it can be reallocated / cleared on the next pump).
@@ -394,6 +419,7 @@ export class Session {
     this.statusByHandle.set(handle, {
       state, progress, totalDone, totalWanted, downloadRate, uploadRate,
       numPeers, numSeeds, numPiecesTotal, numPiecesHave, paused,
+      autoManaged, queuePosition, errorCode, error,
       hasMetadata: state !== TORRENT_STATE.downloadingMetadata,
     })
   }

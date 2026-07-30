@@ -215,6 +215,19 @@ void emit_state_update(lt::state_update_alert const* sua) {
     i32(st.num_peers);
     i32(st.num_seeds);
     u32((st.flags & lt::torrent_flags::paused) ? 1u : 0u);
+    // `paused` on its own cannot say WHY a torrent stopped, and the three reasons want
+    // very different handling. auto_managed survives an error (update_state_list gates on
+    // is_auto_managed() && !has_error(), it does not clear the flag), so the pair splits
+    // cleanly: errc set is a failure, auto-managed without an error is the queue holding
+    // the torrent behind others, and neither is someone having pressed pause.
+    u32((st.flags & lt::torrent_flags::auto_managed) ? 1u : 0u);
+    i32(static_cast<std::int32_t>(static_cast<int>(st.queue_position)));
+    i32(st.errc ? st.errc.value() : 0);
+    // The message travels with the status, so a failure is attributed to the torrent that
+    // owns it rather than to whichever one happened to be nearby when an alert arrived.
+    std::string const err = st.errc ? st.errc.message() : std::string();
+    u32(static_cast<std::uint32_t>(err.size()));
+    p.insert(p.end(), err.begin(), err.end());
     u32(static_cast<std::uint32_t>(nbits));
     u32(static_cast<std::uint32_t>(nbytes));
     std::size_t const base = p.size();
