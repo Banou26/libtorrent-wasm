@@ -1,11 +1,5 @@
 // check() is what tells libtorrent whether to trust a torrent's recorded pieces or hash
-// them back off the disk, and both wrong answers are expensive: no_error over real files
-// turns a force_recheck into a full re-download, need_full_check over an empty directory
-// hashes a whole torrent's worth of nothing.
-//
-// Runs the built build/opfs.js against a fake OPFS, so none of this needs a browser.
-//
-// Run: node --test tests/opfs-check.test.mjs
+// them back off the disk, and both wrong answers are expensive.
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -17,7 +11,6 @@ class NotFound extends Error {
   constructor() { super('not found'); this.name = 'NotFoundError' }
 }
 
-// Directory tree of { [name]: number | Directory }, where a number is a file's size.
 const makeDir = (entries = {}) => ({
   entries,
   async getDirectoryHandle(name, opts) {
@@ -39,8 +32,7 @@ const makeDir = (entries = {}) => ({
   },
 })
 
-// node exposes navigator as a getter-only global, so it has to be redefined rather than
-// assigned.
+// node exposes navigator as a getter-only global, so it has to be redefined rather than assigned
 const withRoot = async (root, run) => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
   Object.defineProperty(globalThis, 'navigator', {
@@ -75,8 +67,7 @@ test('trusts an empty storage rather than hashing nothing', async () => {
   })
 })
 
-// openFile creates files on demand, so a torrent that was only ever read from leaves
-// zero-length files behind. Counting those as data would hash every one of them.
+// openFile creates files on demand, so a torrent that was only ever read from leaves zero-length files behind
 test('treats a zero-length file as no data', async () => {
   const root = makeDir({ dl: makeDir({ 'movie.mkv': 0, extras: makeDir({ 'sample.mkv': 0 }) }) })
   await withRoot(root, async () => {
@@ -95,8 +86,6 @@ test('finds bytes in a nested file, not just the first one', async () => {
   })
 })
 
-// libtorrent calls async_check_files from inside the same synchronous pass that creates
-// the storage, so this is the ordering that actually happens on every add, not a corner.
 test('waits for a storage that is still opening', async () => {
   const root = makeDir({ dl: makeDir({ 'movie.mkv': 512 }) })
   await withRoot(root, async () => {
@@ -113,13 +102,10 @@ test('answers for a storage it has never heard of instead of throwing', async ()
   const root = makeDir({})
   await withRoot(root, async () => {
     const storage = new OPFSStorage()
-    // A rejection reaches libtorrent as a disk error, which stops the torrent outright.
     assert.equal(await storage.check(99), NO_ERROR)
   })
 })
 
-// Never opening is not the same as opening and finding nothing, and only one of the two
-// answers is safe to guess at.
 test('asks for a hash pass when the storage failed to open', async () => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
   Object.defineProperty(globalThis, 'navigator', {

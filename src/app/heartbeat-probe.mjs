@@ -1,7 +1,3 @@
-// End-to-end smoke test: load live.html, add the magnet, watch for 30s.
-// Polls window state every second from node-side so we get a heartbeat
-// even if page-side timers are sad. Reports the final session stats.
-
 import { chromium } from '/home/banou/dev/fkn/proxy/node_modules/playwright/index.mjs'
 
 const URL_ = 'http://localhost:4560/live.html'
@@ -22,14 +18,12 @@ try {
   page.setDefaultTimeout(3000)
   page.on('console', m => {
     const t = m.text()
-    // Only surface signal - drop the [vite] HMR chatter and the WASM startup spam.
     if (/^\[(vite|FKN)\]/.test(t) || /^\[lt\]/.test(t) || /unsupported syscall/.test(t)) return
     log('  console', m.type(), t)
   })
   let pageErrorSeen = 0
   page.on('pageerror', e => {
     pageErrorSeen++
-    // First 3 errors get the full stack; rest get one-line dedup.
     if (pageErrorSeen <= 3) log('  PAGEERROR', e.message, '\n' + (e.stack || ''))
     else if (pageErrorSeen === 4) log('  PAGEERROR (more suppressed, same as above)')
   })

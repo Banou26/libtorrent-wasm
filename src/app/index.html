@@ -38,9 +38,7 @@
     <pre id="alerts"></pre>
 
     <script>
-      // Node-stdlib shims expected by @fkn/lib transitive deps (buffer,
-      // stream, events). Match live.html: forward nextTick args, otherwise
-      // readable-stream's resume_(stream, state) runs with state=undefined.
+      // nextTick must forward its args, or readable-stream's resume_(stream, state) runs with state=undefined
       window.global = window
       window.process = { env: { NODE_DEBUG: '' }, version: '', nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)) }
     </script>

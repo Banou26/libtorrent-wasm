@@ -26,7 +26,6 @@
       window.addEventListener('error', e => log('window error: ' + e.message, 'bad'))
       window.addEventListener('unhandledrejection', e => log('unhandled: ' + (e.reason?.message ?? e.reason), 'bad'))
 
-      // Marker to know the script started.
       log('script started', 'info')
 
       try {

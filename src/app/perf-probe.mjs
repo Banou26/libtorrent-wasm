@@ -1,8 +1,3 @@
-// Drive live.html via raw playwright. Every page call goes through a
-// hard wall-clock timeout so a frozen renderer can't hang this script.
-//
-// Usage: node perf-probe.mjs
-
 import { chromium } from '/home/banou/dev/fkn/proxy/node_modules/playwright/index.mjs'
 import { writeFile } from 'node:fs/promises'
 
@@ -39,22 +34,18 @@ try {
 
   const probe = async (label) => {
     const tries = []
-    // Probe A: trivial - does eval itself work?
     try {
       const a = await T(`${label}/trivial`, page.evaluate(() => 1+1), 1500)
       tries.push(`trivial=${a}`)
     } catch (e) { tries.push(`trivial=${e.message}`) }
-    // Probe B: read-only window field - no FKN touched
     try {
       const b = await T(`${label}/url`, page.evaluate(() => document.location.href.length), 1500)
       tries.push(`url=${b}`)
     } catch (e) { tries.push(`url=${e.message}`) }
-    // Probe C: status (touches __FKN.fds.size + diag counters - no syscalls)
     try {
       const c = await T(`${label}/status`, page.evaluate(() => window.__status?.()), 1500)
       tries.push(`status=${JSON.stringify(c)}`)
     } catch (e) { tries.push(`status=${e.message}`) }
-    // Probe D: rx length
     try {
       const d = await T(`${label}/rx`, page.evaluate(() => window.__rx?.()?.length), 1500)
       tries.push(`rx=${d}`)

@@ -1,62 +1,14 @@
-// Emscripten JS library: routes BSD socket syscalls through @fkn/lib's
-// net/dgram and routes disk_io callbacks to a host-supplied storage handler.
-//
-// Build with:  emcc ... --js-library=js/library_fkn.js
-//
-// HOW THIS AVOIDS THE 4 MB/s CEILING
-//
-// Every operation here is *non-blocking*. The C++ side runs io_context.poll()
-// in a tight loop on the main worker thread; Asio's select_reactor walks our
-// fd state with poll()/select(), both of which return immediately. There is
-// no Asyncify yield anywhere on the hot path - the only async work happens
-// JS-side, after which we either:
-//   (a) push received bytes into a per-fd ring buffer and trigger a tick, or
-//   (b) flip a writability flag so the next poll() reports the fd writable.
-//
-// Result: a recv loop costs one JS↔WASM call per drained chunk, not per byte
-// and not per packet.
-//
-// HOST INTEGRATION
-//
-// Before instantiating the module, host code must call:
-//   Module.fkn = { net, dgram, storage }
-// where:
-//   - net   is @fkn/lib's net module (or @webvpn/net) - exposes Socket/Server
-//   - dgram is @fkn/lib's dgram      (or @webvpn/dgram)
-//   - storage implements:
-//       { onNewStorage(id, savePath, files), onRemoveStorage(id),
-//         read(id, file, off, len) -> Promise<Uint8Array>,
-//         write(id, file, off, bytes) -> Promise<void>,
-//         release(id) -> Promise<void>, check(id) -> Promise<status>,
-//         ... }
-//
-// All host calls happen on the same worker thread that the module runs on.
-
 addToLibrary({
-  // ---- shared state, injected as $FKN ------------------------------------
   $FKN__deps: ['$ERRNO_CODES'],
-  // emscripten's jsifier evaluates this object in Node and JSON-serializes its
-  // data members - a live `new Map()` in the literal below becomes `{}`, so the
-  // fd table loses `.has`/`.set`/`.get`. Re-create it as a real Map in a postset
-  // (emitted verbatim after `var FKN = {…}`, before any socket syscall runs).
+  // emscripten's jsifier JSON-serializes this object's data members, so a live `new Map()` in the literal below becomes `{}`
   $FKN__postset: 'FKN.fds = new Map(); FKN.freeFds = [];',
   $FKN: {
     initialized: false,
-    // Set from Module.fkn.debug at init. Declared here so a trace that runs before init
-    // (there is one, in socket()) reads false rather than undefined.
     debug: false,
 
-    // Emscripten uses WASI errno values, NOT Linux's. The differences
-    // *matter*: returning Linux EINPROGRESS (115) from connect() makes
-    // Asio see a random error instead of EINPROGRESS (26), so it never
-    // arms a POLLOUT watcher on the fd - the connect handler never
-    // fires, the BT handshake never goes out, and every TCP peer
-    // connection sits dead in the water. Same trap for EAGAIN: Linux
-    // 11 != WASI 6 (which is what error::would_block compares against).
-    //
-    // Anything we set/return as an errno from this file MUST use these.
+    // Emscripten uses WASI errno values, NOT Linux's; anything we set/return as an errno from this file MUST use these
     err: {
-      AGAIN: 6,        // EWOULDBLOCK = EAGAIN
+      AGAIN: 6,
       BADF: 8,
       CONNREFUSED: 14,
       CONNRESET: 15,
@@ -70,35 +22,21 @@ addToLibrary({
       TIMEDOUT: 73,
     },
 
-    // Fd allocator. Asio's select_reactor on Emscripten uses select() with
-    // FD_SETSIZE=1024, so fds must stay strictly below that. Start at 16 to
-    // give libc room for stdio (0-2) and any sockfs entries Emscripten may
-    // allocate before we take over.
+    // Asio's select_reactor on Emscripten uses select() with FD_SETSIZE=1024, so fds must stay strictly below that
+    // start at 16 to leave libc room for stdio (0-2) and any sockfs entries Emscripten allocates before the shim takes over; closeFd's `fd >= 16 && fd < 1024` reuse guard is coupled to this value and to FD_SETSIZE
     nextFd: 16,
-    fds: null, // real Map assigned in $FKN__postset (see note above)
+    fds: null,
     freeFds: null,
 
-    // Tick scheduler: requested from JS callbacks when something becomes
-    // ready that the C side hasn't seen yet.
     pendingTick: false,
-    // Scheduler: use a MessageChannel-driven post (task priority, no 4ms
-    // setTimeout-min-delay floor) when there's active work to drain - gives
-    // ~submilliseconds-per-tick under load. Fall back to setTimeout(16)
-    // when ran===0 to give the renderer breathing room (paint, compositor).
-    //
-    // MessageChannel doesn't starve macrotasks the way self-rearming
-    // queueMicrotask does - it queues a regular task, so timers, render,
-    // and CDP eval all still get interleaved.
+    // a MessageChannel post has no 4ms setTimeout-min-delay floor and doesn't starve macrotasks the way self-rearming queueMicrotask does
     scheduleTick() {
       FKN.stats.schedule++
       if (FKN.pendingTick) return
       FKN.pendingTick = true
       if (FKN.tickIdle) {
-        // Idle path: 16ms cadence keeps timers/CPU low when nothing is
-        // flowing. The first tick after a quiet period is here.
         setTimeout(FKN._doTick, 16)
       } else {
-        // Active path: MessageChannel post - fires as the next task.
         FKN._mc.port2.postMessage(null)
       }
     },
@@ -108,8 +46,6 @@ addToLibrary({
       if (!Module._lt_session_tick) return
       FKN.stats.tick++
       const ran = Module._lt_session_tick()
-      // ran>0 means more work pending; stay on the fast path. ran===0
-      // means quiet - switch to setTimeout next time.
       FKN.tickIdle = (ran === 0)
       if (ran > 0) FKN.scheduleTick()
     },
@@ -119,8 +55,6 @@ addToLibrary({
       FKN._mc.port1.onmessage = FKN._doTick
     },
 
-    // Lightweight counters. The host can inspect FKN.stats for diagnostics
-    // without paying any per-call overhead beyond an ++.
     stats: {
       socket: 0, bind: 0, listen: 0, accept: 0, connect: 0, close: 0,
       recv: 0, recvfrom: 0, send: 0, sendto: 0,
@@ -132,27 +66,8 @@ addToLibrary({
       diskRead: 0, diskWrite: 0,
     },
 
-    // Disk storage handlers - set by host via Module.fkn.storage.
     storage: null,
 
-    // Per-fd state shape:
-    //   { kind: 'tcp' | 'tcp-listen' | 'udp',
-    //     nonblock: bool, error: 0|errno,
-    //     // tcp/tcp-listen:
-    //     socket: NetSocket | undefined,    // @fkn/lib net.Socket
-    //     server: NetServer | undefined,    // @fkn/lib net.Server
-    //     acceptQueue: Array<{socket,...}>, // for listeners
-    //     // recv buffer: list of Uint8Array chunks waiting to be drained
-    //     recv: { chunks: [], total: 0, fin: false, error: 0 },
-    //     // for udp:
-    //     udpRecv: Array<{ data: Uint8Array, addr: string, port: int, family }>,
-    //     // connection state:
-    //     connecting: bool, connected: bool,
-    //     localAddr, localPort, localFamily,
-    //     remoteAddr, remotePort, remoteFamily,
-    //     // writability is conservative - we set true unless a write is in flight.
-    //     writable: true,
-    //   }
     newFd(state) {
       const fd = FKN.freeFds.length
         ? FKN.freeFds.pop()
@@ -173,7 +88,7 @@ addToLibrary({
         if (state.socket?.destroy) state.socket.destroy()
         else if (state.socket?.close) state.socket.close()
         if (state.server) state.server.close()
-      } catch (e) { /* ignore - already gone */ }
+      } catch (e) {}
     },
 
     closeFd(fd) {
@@ -181,23 +96,12 @@ addToLibrary({
       if (!s) return
       FKN.fds.delete(fd)
       if (fd >= 16 && fd < 1024) FKN.freeFds.push(fd)
-      // Marked before tearing it down, so the close handler reads this as the fd
-      // going away rather than an outage worth reopening for.
+      // marked before tearing it down, so the close handler reads this as the fd going away rather than an outage worth reopening for
       s.closed = true
       FKN.closeState(s)
     },
 
-    // ---- UDP socket lifecycle ----------------------------------------------
-    // The datagram socket under a udp fd does not survive losing the connection:
-    // the tunnel drops it, and from that moment sends go nowhere and no packet
-    // ever arrives again. Nothing above notices, because a dead socket still
-    // accepts send() without complaint and an empty receive queue is
-    // indistinguishable from a quiet one. DHT, UDP trackers and uTP all stop
-    // while the session reports itself perfectly healthy.
-    //
-    // libtorrent cannot fix this: it holds the fd, not the socket. So the fd
-    // keeps its identity and the socket underneath is replaced, re-bound to the
-    // same local port. Everything above the shim carries on unaware.
+    // the datagram socket under a udp fd does not survive losing the connection, so the fd keeps its identity and the socket underneath is replaced, re-bound to the same local port
     UDP_REOPEN_DELAYS: [250, 1000, 3000, 10000, 30000],
 
     attachUdp(st) {
@@ -209,12 +113,7 @@ addToLibrary({
         const _t0 = performance.now()
         FKN._dbgWorkerUdpPkts++
         FKN._dbgWorkerUdpBytes += data.length || data.byteLength || 0
-        // CRITICAL: copy the buffer. @fkn/lib's WebTransport datagram reader
-        // re-uses backing buffers across reads - if we stash the original
-        // Uint8Array reference, by the time C++ drains it on the next tick
-        // the bytes have been overwritten by a later datagram. That
-        // corruption manifests as hash-piece-failed alerts and instant
-        // peer bans; tens of MB of bandwidth wasted per second.
+        // CRITICAL: copy the buffer - @fkn/lib's WebTransport datagram reader re-uses backing buffers across reads
         const src = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data)
         const copy = new Uint8Array(src.length)
         copy.set(src)
@@ -222,7 +121,6 @@ addToLibrary({
           data: copy,
           address: rinfo.address, port: rinfo.port, family: rinfo.family,
         })
-        // Traffic is flowing again, so the next outage starts from the short delay.
         st.reopenAttempts = 0
         FKN.scheduleTick()
         FKN._dbgJsBusyUs += (performance.now() - _t0) * 1000
@@ -232,16 +130,13 @@ addToLibrary({
         st.error = err.errno || FKN.err.IO
         FKN.reopenUdp(st, 'error')
       })
-      // A dropped tunnel usually looks like a clean close rather than an error,
-      // which is why watching only 'error' left the socket silently dead.
+      // a dropped tunnel usually looks like a clean close rather than an error
       sock.on('close', () => FKN.reopenUdp(st, 'close'))
       sock.on('listening', () => {
         const a = sock.address()
         st.localAddr = a.address; st.localPort = a.port; st.localFamily = a.family
       })
 
-      // A replacement has to land back on the port the session announced, or
-      // every peer that already has our endpoint is talking to nobody.
       if (st.bound) {
         try { sock.bind(st.localPort, st.localAddr) }
         catch (e) { FKN.reopenUdp(st, 'bind') }
@@ -261,12 +156,11 @@ addToLibrary({
       setTimeout(() => {
         st.reopening = false
         if (st.closed) return
-        try { st.socket?.close?.() } catch (e) { /* already gone */ }
+        try { st.socket?.close?.() } catch (e) {}
         try {
           FKN.attachUdp(st)
           FKN.scheduleTick()
         } catch (e) {
-          // Keep trying: the tunnel itself may still be coming back.
           FKN.reopenUdp(st, 'reopen-failed')
         }
       }, delay)
@@ -278,9 +172,6 @@ addToLibrary({
       if (!host || !host.net || !host.dgram) {
         throw new Error('Module.fkn = { net, dgram, storage } must be set before _lt_session_create()')
       }
-      // Off unless the host asks for it. These traces run to hundreds of lines a minute on
-      // an ordinary download, which is fine while working on the transport and pure noise in
-      // anyone else's console.
       FKN.debug = !!host.debug
       if (FKN.debug) console.log('[FKN] init')
       FKN.host = host
@@ -288,28 +179,22 @@ addToLibrary({
       FKN.dgram = host.dgram
       FKN.storage = host.storage || null
       FKN.initialized = true
-      // Expose for diagnostic inspection from the host.
       if (typeof Module === 'object') Module.__FKN = FKN
       FKN._mcInit()
     },
 
-    // sockaddr_in / sockaddr_in6 readers/writers. Asio passes these as raw
-    // memory pointers; we read them here once per call.
-    //
-    // sockaddr_in:   u16 family, u16 port (BE), u32 addr (BE), 8 pad
-    // sockaddr_in6:  u16 family, u16 port (BE), u32 flowinfo, 16 addr, u32 scope
+    // sockaddr_in: u16 family, u16 port (BE), u32 addr (BE), 8 pad; sockaddr_in6: u16 family, u16 port (BE), u32 flowinfo, 16 addr, u32 scope
     readSockaddr(ptr, len) {
       const fam = HEAPU16[ptr >> 1]
-      if (fam === 2 /* AF_INET */) {
+      if (fam === 2) {
         const port = (HEAPU8[ptr + 2] << 8) | HEAPU8[ptr + 3]
         const a = HEAPU8[ptr + 4], b = HEAPU8[ptr + 5]
         const c = HEAPU8[ptr + 6], d = HEAPU8[ptr + 7]
         return { family: 'IPv4', port, address: `${a}.${b}.${c}.${d}` }
       }
-      if (fam === 10 /* AF_INET6 */) {
+      if (fam === 10) {
         const port = (HEAPU8[ptr + 2] << 8) | HEAPU8[ptr + 3]
         const bytes = HEAPU8.subarray(ptr + 8, ptr + 24)
-        // Compose canonical IPv6 string. Simple form; the host can canonicalise.
         const groups = []
         for (let i = 0; i < 16; i += 2) {
           groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16))
@@ -323,7 +208,7 @@ addToLibrary({
       if (!ptr || !ep) return
       const max = lenPtr ? HEAP32[lenPtr >> 2] : 16
       if (ep.family === 'IPv4' && max >= 16) {
-        HEAPU16[ptr >> 1] = 2 // AF_INET
+        HEAPU16[ptr >> 1] = 2
         HEAPU8[ptr + 2] = (ep.port >> 8) & 0xff
         HEAPU8[ptr + 3] = ep.port & 0xff
         const parts = ep.address.split('.').map(Number)
@@ -334,12 +219,10 @@ addToLibrary({
         for (let i = 8; i < 16; i++) HEAPU8[ptr + i] = 0
         if (lenPtr) HEAP32[lenPtr >> 2] = 16
       } else if (ep.family === 'IPv6' && max >= 28) {
-        HEAPU16[ptr >> 1] = 10 // AF_INET6
+        HEAPU16[ptr >> 1] = 10
         HEAPU8[ptr + 2] = (ep.port >> 8) & 0xff
         HEAPU8[ptr + 3] = ep.port & 0xff
         HEAP32[(ptr + 4) >> 2] = 0
-        // Parse "1:2:3::4" etc. Minimal handling; relies on the host
-        // already canonicalising via ip-address before we ever see it.
         const fullGroups = parseIPv6(ep.address)
         for (let i = 0; i < 8; i++) {
           HEAPU8[ptr + 8 + i * 2] = (fullGroups[i] >> 8) & 0xff
@@ -351,7 +234,6 @@ addToLibrary({
     },
   },
 
-  // ---- socket lifecycle --------------------------------------------------
   $FKN_socket__deps: ['$FKN'],
   $FKN_socket(domain, type) {
     FKN.init()
@@ -360,8 +242,6 @@ addToLibrary({
     const SOCK_TYPE = type & 0xf
     const family = domain === 10 ? 'IPv6' : 'IPv4'
     if (SOCK_TYPE === 1) {
-      // TCP, unconnected. Will become a client on connect() or a server
-      // on bind+listen.
       const fd = FKN.newFd({
         kind: 'tcp-unbound', family, nonblock: false,
         diag: { polled: 0, polledOut: 0, polledIn: 0, dataChunks: 0, sendCalls: 0, recvCalls: 0, connectAt: 0, connectedAt: 0 }
@@ -373,9 +253,6 @@ addToLibrary({
         kind: 'udp', family, nonblock: false,
         socket: null, udpRecv: [], reopenAttempts: 0,
       }
-      // Per-second packet rate / byte rate counter on the worker side of
-      // the cross-realm hop. Diff against the iframe-side counter to see
-      // whether the iframe→worker osra path is dropping anything.
       FKN._dbgWorkerUdpPkts = FKN._dbgWorkerUdpPkts || 0
       FKN._dbgWorkerUdpBytes = FKN._dbgWorkerUdpBytes || 0
       if (FKN.debug && !FKN._dbgWorkerUdpStarted) {
@@ -388,7 +265,6 @@ addToLibrary({
           FKN._dbgWorkerUdpBytes = 0
         }, 1000)
       }
-      // Init JS-busy counter
       if (FKN.debug && !FKN._dbgJsBusyStarted) {
         FKN._dbgJsBusyStarted = true
         FKN._dbgJsBusyUs = 0
@@ -409,7 +285,6 @@ addToLibrary({
     return -FKN.err.INVAL
   },
 
-  // ---- TCP connect (non-blocking) ----------------------------------------
   $FKN_connect__deps: ['$FKN'],
   $FKN_connect(fd, addrPtr, addrLen) {
     const st = FKN.fds.get(fd)
@@ -418,7 +293,6 @@ addToLibrary({
     if (!ep) return -FKN.err.INVAL
 
     if (st.kind === 'udp') {
-      // connected UDP just sets the default remote; do it locally.
       st.remoteAddr = ep.address
       st.remotePort = ep.port
       st.remoteFamily = ep.family
@@ -444,13 +318,12 @@ addToLibrary({
         st.localAddr = sock.localAddress
         st.localPort = sock.localPort
         st.localFamily = sock.localFamily
-      } catch (e) { /* before-connect getters throw - ignore */ }
+      } catch (e) {}
       FKN.scheduleTick()
     })
     sock.on('data', (chunk) => {
       st.diag.dataChunks++
-      // Copy the chunk - @fkn/lib's TCP stream may re-use backing buffers
-      // across reads (same bug as the UDP path causing hash-piece-failed).
+      // CRITICAL: copy the chunk - @fkn/lib's TCP stream re-uses backing buffers across reads, and stashing the original surfaces as hash-piece-failed alerts and instant peer bans
       const src = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)
       const copy = new Uint8Array(src.length)
       copy.set(src)
@@ -469,7 +342,6 @@ addToLibrary({
     return st.nonblock ? -FKN.err.INPROGRESS : 0
   },
 
-  // ---- TCP bind + listen + accept ----------------------------------------
   $FKN_bind__deps: ['$FKN'],
   $FKN_bind(fd, addrPtr, addrLen) {
     if (FKN.debug) console.log('[FKN] bind(fd=' + fd + ')')
@@ -480,16 +352,11 @@ addToLibrary({
     if (st.kind === 'udp') {
       st.socket.bind(ep.port, ep.address)
       st.localAddr = ep.address; st.localPort = ep.port; st.localFamily = ep.family
-      // Remembered so a socket replaced after an outage returns to the same
-      // endpoint, which is the one every peer and tracker already has.
       st.bound = true
       return 0
     }
     if (st.kind === 'tcp-unbound') {
-      // Defer the actual listen() until listen() is called - but expose the
-      // bind address immediately so getsockname() between bind and listen
-      // doesn't fail (Asio calls getsockname inside setup_listener to
-      // detect IPv4-mapped-IPv6 and the real port).
+      // Asio calls getsockname inside setup_listener, so expose the bind address before the deferred listen()
       st.pendingBindAddr = ep.address
       st.pendingBindPort = ep.port
       st.family = ep.family
@@ -502,7 +369,7 @@ addToLibrary({
   },
 
   $FKN_listen__deps: ['$FKN'],
-  $FKN_listen(fd /*, backlog */) {
+  $FKN_listen(fd) {
     if (FKN.debug) console.log('[FKN] listen(fd=' + fd + ')')
     const st = FKN.fds.get(fd)
     if (!st || st.kind !== 'tcp-unbound') return -FKN.err.INVAL
@@ -542,6 +409,7 @@ addToLibrary({
     } catch (e) {}
     const newFd = FKN.newFd(newSt)
     sock.on('data', (chunk) => {
+      // CRITICAL: copy the chunk - @fkn/lib's TCP stream re-uses backing buffers across reads, and stashing the original surfaces as hash-piece-failed alerts and instant peer bans
       const src = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)
       const copy = new Uint8Array(src.length)
       copy.set(src)
@@ -563,9 +431,8 @@ addToLibrary({
     return newFd
   },
 
-  // ---- read/write paths --------------------------------------------------
   $FKN_recv__deps: ['$FKN'],
-  $FKN_recv(fd, bufPtr, len /*, flags */) {
+  $FKN_recv(fd, bufPtr, len) {
     FKN.stats.recv++
     {
       const st = FKN.fds.get(fd)
@@ -576,7 +443,7 @@ addToLibrary({
     if (st.error) { const e = st.error; st.error = 0; return -e }
     const r = st.recv
     if (r.total === 0) {
-      if (r.fin) return 0 // graceful EOF
+      if (r.fin) return 0
       return -FKN.err.AGAIN
     }
     let need = Math.min(len, r.total)
@@ -594,19 +461,13 @@ addToLibrary({
       written += take
     }
     FKN.stats.tcpRx += written
-    // CRITICAL: if there's data still buffered (asio read partial), re-arm
-    // the tick. Otherwise asio is waiting for a poll edge that never comes
-    // (we delivered the on('data') event already; the rest of the chunk
-    // never triggers a new schedule). This was THE bug behind "TCP fd
-    // connects, handshake exchanges, then silence" - libtorrent was
-    // asking for 104 bytes out of 226 available and never woke up to
-    // read the remaining 122.
+    // CRITICAL: data still buffered has to re-arm the tick, otherwise asio waits for a poll edge that never comes
     if (r.total > 0) FKN.scheduleTick()
     return written
   },
 
   $FKN_recvfrom__deps: ['$FKN'],
-  $FKN_recvfrom(fd, bufPtr, len, /*flags*/ _f, addrPtr, addrLenPtr) {
+  $FKN_recvfrom(fd, bufPtr, len, _f, addrPtr, addrLenPtr) {
     FKN.stats.recvfrom++
     const st = FKN.fds.get(fd)
     if (!st || st.kind !== 'udp') return -FKN.err.BADF
@@ -624,7 +485,7 @@ addToLibrary({
   },
 
   $FKN_send__deps: ['$FKN'],
-  $FKN_send(fd, bufPtr, len /*, flags */) {
+  $FKN_send(fd, bufPtr, len) {
     FKN.stats.send++
     {
       const st = FKN.fds.get(fd)
@@ -651,7 +512,7 @@ addToLibrary({
   },
 
   $FKN_sendto__deps: ['$FKN'],
-  $FKN_sendto(fd, bufPtr, len, /*flags*/ _f, addrPtr, addrLen) {
+  $FKN_sendto(fd, bufPtr, len, _f, addrPtr, addrLen) {
     FKN.stats.sendto++
     const st = FKN.fds.get(fd)
     if (!st || st.kind !== 'udp') return -FKN.err.BADF
@@ -661,10 +522,7 @@ addToLibrary({
           ? { address: st.remoteAddr, port: st.remotePort, family: st.remoteFamily }
           : null)
     if (!ep) return -FKN.err.INVAL
-    // Reporting a send as delivered over a socket that is gone is what made the
-    // failure invisible: the engine believed every packet left and simply waited
-    // forever for replies. EAGAIN is the honest answer while the socket is being
-    // replaced, and it is one the caller already knows how to handle.
+    // EAGAIN is the honest answer while the socket is being replaced; reporting a send as delivered over a socket that is gone makes the loss invisible
     if (st.dead || !st.socket) {
       FKN.reopenUdp(st, 'send-on-dead')
       return -FKN.err.AGAIN
@@ -686,7 +544,6 @@ addToLibrary({
     return 0
   },
 
-  // ---- introspection -----------------------------------------------------
   $FKN_getsockname__deps: ['$FKN'],
   $FKN_getsockname(fd, addrPtr, addrLenPtr) {
     const st = FKN.fds.get(fd)
@@ -707,22 +564,17 @@ addToLibrary({
     return 0
   },
 
-  // libtorrent calls many socket options (TCP_NODELAY, SO_REUSEADDR, IP_TOS,
-  // SO_KEEPALIVE, IPV6_V6ONLY, etc). Most don't apply over a WebVPN tunnel.
-  // We accept everything and stash the few that the underlying polyfill can
-  // forward (NODELAY, KEEPALIVE, *_BUFFER_SIZE).
+  // most options don't apply over a WebVPN tunnel: accept everything and forward only the few the underlying polyfill can
   $FKN_setsockopt__deps: ['$FKN'],
   $FKN_setsockopt(fd, level, optname, optvalPtr, optvalLen) {
     const st = FKN.fds.get(fd)
     if (!st) return -FKN.err.BADF
-    if (!st.socket) return 0 // unbound TCP: silently accept
-    // IPPROTO_TCP = 6; TCP_NODELAY = 1
+    if (!st.socket) return 0
     if (level === 6 && optname === 1 && st.socket.setNoDelay) {
       const on = optvalLen >= 4 ? HEAP32[optvalPtr >> 2] : 1
       try { st.socket.setNoDelay(!!on) } catch (e) {}
       return 0
     }
-    // SOL_SOCKET = 1; SO_KEEPALIVE = 9
     if (level === 1 && optname === 9 && st.socket.setKeepAlive) {
       const on = optvalLen >= 4 ? HEAP32[optvalPtr >> 2] : 1
       try { st.socket.setKeepAlive(!!on) } catch (e) {}
@@ -735,7 +587,6 @@ addToLibrary({
   $FKN_getsockopt(fd, level, optname, optvalPtr, optvalLenPtr) {
     const st = FKN.fds.get(fd)
     if (!st) return -FKN.err.BADF
-    // SO_ERROR (1, 4): used by Asio to check connect() result.
     if (level === 1 && optname === 4) {
       const err = st.error || 0
       st.error = 0
@@ -758,11 +609,9 @@ addToLibrary({
     return 0
   },
 
-  // ---- poll() ------------------------------------------------------------
-  // pollfd: { i32 fd, i16 events, i16 revents }  -> 8 bytes
-  // POLLIN=1, POLLOUT=4, POLLERR=8, POLLHUP=16
+  // pollfd: { i32 fd, i16 events, i16 revents } -> 8 bytes; POLLIN=1, POLLOUT=4, POLLERR=8, POLLHUP=16
   $FKN_poll__deps: ['$FKN'],
-  $FKN_poll(fdsPtr, nfds /*, timeout */) {
+  $FKN_poll(fdsPtr, nfds) {
     FKN.stats.poll++
     FKN.stats.pollCalls += nfds
     let ready = 0
@@ -785,10 +634,6 @@ addToLibrary({
           (st.kind === 'udp' && true)
         )) revents |= 4
         if (st.error) revents |= 8
-        // Track which TCP fds Asio is even asking about - connected or not.
-        // Asio adds a fd to its watch list during async_connect (POLLOUT
-        // interest); if no TCP fd ever shows up here it means Asio
-        // never armed the watcher.
         if (st.kind === 'tcp') {
           if (st.connected) FKN.stats._tcpPolledConnected = (FKN.stats._tcpPolledConnected || 0) + 1
           else FKN.stats._tcpPolledConnecting = (FKN.stats._tcpPolledConnecting || 0) + 1
@@ -808,35 +653,19 @@ addToLibrary({
     return ready
   },
 
-  // ---- DNS: getaddrinfo --------------------------------------------------
-  // Asio uses this on tracker URLs and on bootstrap nodes. We stub it to
-  // emit a single record with the input string as `sa_data` so Asio can
-  // pass it through to FKN_connect (which doesn't need a resolved IP - the
-  // WebVPN server resolves on our behalf).
-  //
-  // The real getaddrinfo returns a linked list of addrinfo; we synthesize
-  // one entry whose ai_addr points to a sockaddr_in we own.
+  // unused hook, not the live DNS path (that is js_resolver_async + the C++ resolver): this synthesized addrinfo is a placeholder returning the input for the WebVPN server to resolve on connect
   $FKN_resolve__deps: ['$FKN'],
   $FKN_resolve(hostPtr, port, isV6) {
-    // Allocate a small block: addrinfo + sockaddr_in6 (worst case 28 + 48 bytes)
     const ai = _malloc(48 + 28)
     const sa = ai + 48
-    // sockaddr_in6 minimal fill
     HEAPU16[sa >> 1] = isV6 ? 10 : 2
     HEAPU8[sa + 2] = (port >> 8) & 0xff
     HEAPU8[sa + 3] = port & 0xff
     for (let i = 4; i < 28; i++) HEAPU8[sa + i] = 0
-    // ... in practice libtorrent calls Asio's resolver which posts back an
-    // endpoint object the BT logic uses directly. The cleanest path is to
-    // intercept resolver inside the C wrapper. Leaving this as a hook for
-    // future iteration. For now it returns the input as a v4 dotted address
-    // if it parses, else the WebVPN server resolves it on connect.
     return ai
   },
 
-  // ---- disk_io callbacks: JS-side handlers wired by host -----------------
-  // The C++ side calls js_disk_* via extern "C". We declare them here as
-  // members of the Emscripten library so they are exposed to the WASM side.
+  // the C++ side calls js_disk_* via extern "C", so these names are a contract
   js_disk_new_storage__deps: ['$FKN'],
   js_disk_new_storage(id, savePathPtr, fileListPtr, fileListLen) {
     if (!FKN.storage) return
@@ -860,17 +689,14 @@ addToLibrary({
     FKN.stats.diskRead++
     const offset = offsetLo + offsetHi * 0x100000000
     if (!FKN.storage) {
-      // Mirror libtorrent's built-in disabled_disk_io: pretend the read
-      // succeeded and hand back zeros. Returning EINVAL instead causes
-      // libtorrent to retry forever and locks up the renderer.
+      // mirror libtorrent's built-in disabled_disk_io: returning EINVAL instead makes libtorrent retry forever
       const ptr = _malloc(len)
       HEAPU8.fill(0, ptr, ptr + len)
       Module._lt_disk_complete_read(jobLo, jobHi, ptr, len, 0)
       return
     }
     const onBytes = (bytes) => {
-      // Allocate a buffer in WASM heap; the disk_buffer_holder owns it
-      // and lt_disk_complete_read schedules its free().
+      // the disk_buffer_holder owns this buffer and lt_disk_complete_read schedules its free()
       const ptr = _malloc(bytes.length)
       HEAPU8.set(bytes, ptr)
       Module._lt_disk_complete_read(jobLo, jobHi, ptr, bytes.length, 0)
@@ -883,8 +709,6 @@ addToLibrary({
     let result
     try { result = FKN.storage.read(id, fileIdx, offset, len) }
     catch (e) { onErr(e); return }
-    // Fast path: synchronous return (e.g. OPFS hot path with cached handle).
-    // No microtask hop, no scheduleTick (we're already inside a tick).
     if (result && typeof result.then === 'function') {
       result.then(onBytes, onErr).then(() => FKN.scheduleTick())
     } else {
@@ -897,11 +721,10 @@ addToLibrary({
     FKN.stats.diskWrite++
     const offset = offsetLo + offsetHi * 0x100000000
     if (!FKN.storage) {
-      // Disabled-disk: silently accept and discard. No buffer copy needed.
       Module._lt_disk_complete_write(jobLo, jobHi, 0)
       return
     }
-    // Slice off a copy that lives independent of WASM heap reuse.
+    // the copy must live independent of WASM heap reuse
     const bytes = HEAPU8.slice(dataPtr, dataPtr + len)
     const onErr = (e) => {
       Module._lt_disk_complete_write(jobLo, jobHi, e?.errno || FKN.err.IO)
@@ -910,9 +733,6 @@ addToLibrary({
     let result
     try { result = FKN.storage.write(id, fileIdx, offset, bytes) }
     catch (e) { onErr(e); return }
-    // Fast path: sync completion. Avoids microtask hop + redundant
-    // scheduleTick. We're already inside a tick handler, and the C++
-    // disk_io will pick up the completion in the same poll_one loop.
     if (result && typeof result.then === 'function') {
       result.then(
         () => { Module._lt_disk_complete_write(jobLo, jobHi, 0); FKN.scheduleTick() },
@@ -978,19 +798,12 @@ addToLibrary({
     Promise.resolve(FKN.storage.stop(id)).then(finish, finish)
   },
 
-  // ---- syscall overrides --------------------------------------------------
-  // Asio on Emscripten ultimately reaches musl's BSD socket wrappers, which
-  // call these `__syscall_*` entries. We replace them so every socket libc
-  // operation routes through @fkn/lib. Non-socket fds (files, pipes) are
-  // not in FKN.fds, so we fall through to the default behaviour by calling
-  // the unchanged base implementations Emscripten installed.
-
   __syscall_socket__deps: ['$FKN', '$FKN_socket'],
   __syscall_socket: function(domain, type, _protocol) { return FKN_socket(domain, type) },
 
   __syscall_connect__deps: ['$FKN', '$FKN_connect'],
   __syscall_connect: function(fd, addr, addrLen) {
-    if (!FKN.fds.has(fd)) return -FKN.err.BADF // not one of ours
+    if (!FKN.fds.has(fd)) return -FKN.err.BADF
     return FKN_connect(fd, addr, addrLen)
   },
 
@@ -1021,24 +834,8 @@ addToLibrary({
       : FKN_recv(fd, buf, len, flags)
   },
 
-  // sendmsg: scatter-gather send. Boost.Asio uses this on Emscripten for
-  // every TCP write (one msghdr with one iovec covering the buffer; UDP
-  // gets msg_name set). Without an override Emscripten's default fails
-  // with ENOSYS and our peer-side TCP writes silently drop, which is
-  // why the 180 connected TCP fds we saw had `recv=0/send=0`.
-  //
-  // musl msghdr layout (32-bit):
-  //   void*   msg_name        @ 0
-  //   socklen msg_namelen     @ 4
-  //   iovec*  msg_iov         @ 8
-  //   size_t  msg_iovlen      @ 12
-  //   void*   msg_control     @ 16
-  //   size_t  msg_controllen  @ 20
-  //   int     msg_flags       @ 24
-  //
-  // iovec layout:
-  //   void*   iov_base @ 0
-  //   size_t  iov_len  @ 4
+  // Boost.Asio uses sendmsg on Emscripten for every TCP write; without an override Emscripten's default fails with ENOSYS
+  // musl msghdr layout (32-bit): msg_name@0, msg_namelen@4, msg_iov@8, msg_iovlen@12, msg_control@16, msg_controllen@20, msg_flags@24; iovec: iov_base@0, iov_len@4
   __syscall_sendmsg__deps: ['$FKN', '$FKN_send', '$FKN_sendto'],
   __syscall_sendmsg: function(fd, msgPtr, _flags) {
     const st = FKN.fds.get(fd)
@@ -1052,9 +849,6 @@ addToLibrary({
     const nameLen   = HEAPU32[(msgPtr +  4) >> 2]
     const iovPtr    = HEAPU32[(msgPtr +  8) >> 2]
     const iovLen    = HEAPU32[(msgPtr + 12) >> 2]
-    // Concatenate iovecs into one contiguous WASM-heap region by walking
-    // them. Asio in practice only uses 1-2 iovecs per send, so we
-    // optimise for the common one-iovec case.
     let total = 0
     if (iovLen === 1) {
       const iovBase = HEAPU32[(iovPtr + 0) >> 2]
@@ -1064,11 +858,7 @@ addToLibrary({
       }
       return FKN_send(fd, iovBase, iovL, 0)
     }
-    // Multi-iovec: stitch into a single JS-side Uint8Array and hand it
-    // straight to the socket. Avoids any _malloc round trip (which can
-    // grow the heap and detach HEAPU8/HEAPU32 - the prior copyWithin
-    // version corrupted bytes when that happened, surfacing as random
-    // hash-piece failures on the wire).
+    // stitch JS-side rather than via _malloc, which can grow the heap and detach HEAPU8/HEAPU32
     const iovs = []
     for (let i = 0; i < iovLen; i++) {
       const base = HEAPU32[(iovPtr + i * 8 + 0) >> 2]
@@ -1139,21 +929,13 @@ addToLibrary({
     return FKN_getsockopt(fd, level, optname, optval, optlenPtr)
   },
 
-  // poll() is the heart of Asio's select_reactor on Emscripten. We only
-  // service entries whose fd is one of ours; entries with non-FKN fds are
-  // left untouched. In libtorrent's process, *all* socket-style fds come
-  // from us, so this is fine.
   __syscall_poll__deps: ['$FKN', '$FKN_poll'],
   __syscall_poll: function(fdsPtr, nfds, _timeout) {
     return FKN_poll(fdsPtr, nfds, 0)
   },
 
-  // Boost.Asio's reactor on Emscripten (epoll/kqueue/eventfd disabled) is the
-  // SELECT reactor, which calls select() -> __syscall__newselect. Emscripten's
-  // own select doesn't know our fake fds, so without this every async op
-  // (TCP connect/read/write AND UDP read) waits on the reactor forever. Mirror
-  // FKN_poll's readiness over select's fd_set bit arrays (fd N = byte N>>3,
-  // bit N&7; valid on little-endian wasm regardless of NFDBITS word size).
+  // Boost.Asio's reactor on Emscripten is the SELECT reactor, and Emscripten's own select doesn't know our fake fds
+  // fd_set bit arrays: fd N = byte N>>3, bit N&7, valid on little-endian wasm regardless of NFDBITS word size
   __syscall__newselect__deps: ['$FKN'],
   __syscall__newselect: function(nfds, readPtr, writePtr, exceptPtr, _timeoutPtr) {
     FKN.stats.poll++
@@ -1193,28 +975,18 @@ addToLibrary({
   __syscall_fcntl64__deps: ['$FKN', '$FKN_fcntl'],
   __syscall_fcntl64: function(fd, cmd, varargs) {
     if (!FKN.fds.has(fd)) return -FKN.err.BADF
-    // Emscripten passes varargs as a pointer to the arg list; for our F_GETFL
-    // / F_SETFL we only ever care about a single int - read it.
-    const arg = (cmd === 4 /* F_SETFL */) ? HEAP32[varargs >> 2] : 0
+    const arg = (cmd === 4) ? HEAP32[varargs >> 2] : 0
     return FKN_fcntl(fd, cmd, arg)
   },
 
-  // ioctl: Asio's select_reactor calls ioctl(fd, FIONREAD) to size its next
-  // read - per readable socket, every tick - and ioctl(fd, FIONBIO) to toggle
-  // non-blocking. FKN sockets are NOT Emscripten FS streams, so the default
-  // __syscall_ioctl's getStreamFromFD(fd) throws ErrnoError(EBADF) for every
-  // one. Constructing those exceptions (eager stack capture on SpiderMonkey)
-  // burned ~70% of the worker's CPU on Firefox with ~180 connected fds,
-  // starving the uTP tick and collapsing throughput. Handle our fds here so
-  // the hot path never throws. Non-FKN fds get BADF, except musl's first-write
-  // ioctl(1, TIOCGWINSZ) probe, which must return 0 or stdout goes fully
-  // buffered (musl only checks the return value, never the winsize struct).
+  // FKN sockets are NOT Emscripten FS streams, so the default __syscall_ioctl throws ErrnoError(EBADF) per call, which burned ~70% of the worker's CPU on Firefox
+  // musl's first-write ioctl(1, TIOCGWINSZ) probe must return 0 or stdout goes fully buffered
   __syscall_ioctl__deps: ['$FKN'],
   __syscall_ioctl: function(fd, op, varargs) {
     const st = FKN.fds.get(fd)
     if (!st) return (fd <= 2 && op === 0x5413) ? 0 : -FKN.err.BADF
     FKN.stats.ioctl++
-    // FIONREAD (0x541B): bytes available to read, written to the int* argp.
+    // FIONREAD (0x541B): bytes available to read, written to the int* argp
     if (op === 0x541B) {
       const avail = st.kind === 'tcp'
         ? st.recv.total
@@ -1225,32 +997,16 @@ addToLibrary({
       if (argp) HEAP32[argp >> 2] = avail
       return 0
     }
-    // FIONBIO (0x5421): set/clear non-blocking from the int* argp.
+    // FIONBIO (0x5421): set/clear non-blocking from the int* argp
     if (op === 0x5421) {
       const argp = HEAP32[varargs >> 2]
       st.nonblock = !!(argp ? HEAP32[argp >> 2] : 0)
       return 0
     }
-    // Any other ioctl on one of our sockets: no-op success, never throw.
     return 0
   },
 
-  // close and read/write must chain to the original FS-backed
-  // implementations when the fd isn't ours. We achieve that by recording
-  // the originals before overwriting (Emscripten exposes the previous
-  // bindings at runtime via `___syscall_X_orig` is not guaranteed; instead
-  // we just check membership and only handle our fds, returning the
-  // would-be-default for others. For this minimal port we forward unknown
-  // fds via the existing _close / _read / _write the standard library
-  // already linked - which Asio doesn't reach for socket lifetime anyway).
-  // Async DNS bridge - kicked off by resolver.cpp on Emscripten and
-  // completed via Module._lt_dns_complete(host, ip_csv).
-  //
-  // Routes through Module.fkn.dnsLookup (@fkn/lib's WebVPN-tunneled DoH)
-  // when the host provides it, else falls back to plain fetch to
-  // Cloudflare's JSON endpoint. Either way the result returns
-  // asynchronously - the C++ resolver keeps the pending callback parked
-  // in m_callbacks until lt_dns_complete fires.
+  // async DNS bridge kicked off by resolver.cpp: the C++ resolver parks the pending callback in m_callbacks until Module._lt_dns_complete(host, ip_csv) fires with a comma-separated IP list, empty string meaning failure
   js_resolver_async__deps: ['$FKN'],
   js_resolver_async: function(hostPtr, wantV6) {
     if (!FKN.initialized) FKN.init()
@@ -1265,7 +1021,6 @@ addToLibrary({
       _free(hPtr); _free(cPtr)
       FKN.scheduleTick()
     }
-    // Host-provided FKN.dnsLookup is preferred - it goes over the WebVPN.
     const fknLookup = FKN.host && FKN.host.dnsLookup
     if (fknLookup) {
       Promise.resolve(fknLookup(hostname, { family }))
@@ -1277,7 +1032,6 @@ addToLibrary({
         .catch(() => finish(''))
       return
     }
-    // Fallback: direct DoH to 1.1.1.1. Used in tests / when no FKN host.
     const rrType = wantV6 ? 'AAAA' : 'A'
     fetch('https://1.1.1.1/dns-query?name=' + encodeURIComponent(hostname) + '&type=' + rrType,
           { headers: { 'Accept': 'application/dns-json' } })
@@ -1307,19 +1061,12 @@ addToLibrary({
   __syscall_close__deps: ['$FKN', '$FKN_close'],
   __syscall_close: function(fd) {
     if (FKN.fds.has(fd)) return FKN_close(fd)
-    // Not ours - leave it to the runtime. We can't easily chain to the
-    // previous binding without a registry; in the libtorrent shape, this
-    // path is only hit for stdio-style fds, which are closed by the
-    // module shutdown anyway.
     return 0
   },
 })
 
-// Helper used above (Emscripten provides stringToNewUTF8 as of recent
-// versions, but declare it for older toolchains).
+// minimal - handles "::" expansion; the host normalises with ip-address before we see it
 function parseIPv6(addr) {
-  // Returns 8 16-bit group integers for a parsed IPv6. Minimal - handles
-  // "::" expansion. The host normalises with ip-address before we see it.
   if (addr.indexOf('::') !== -1) {
     const [head, tail] = addr.split('::')
     const h = head ? head.split(':').map((x) => parseInt(x, 16)) : []

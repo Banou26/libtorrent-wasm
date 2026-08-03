@@ -1,14 +1,4 @@
-// libtorrent - minimal WASM C API
-//
-// The shape of the bridge:
-//
-//   JS owns sockets (via @fkn/lib net/dgram) and storage (OPFS or app-supplied).
-//   WASM owns the BT state machine, hashing, peer logic.
-//
-//   Every C call here is non-blocking. The JS event loop calls lt_session_tick()
-//   when something changes (data arrived, timer fired, JS pushed a disk
-//   completion). The C++ side runs io_context.poll(), processes whatever is
-//   ready, and returns. No Asyncify.
+// every C call here is non-blocking: JS drives io_context.poll() via lt_session_tick(), no Asyncify
 
 #include <chrono>
 #include <cstdint>
@@ -19,15 +9,7 @@
 #include <unordered_map>
 
 #ifdef __EMSCRIPTEN__
-// Emscripten ships __syscall_setsockopt as a `weak` C stub in
-// emscripten_syscall_stubs.c that always returns -ENOPROTOOPT and prints
-// "warning: unsupported syscall: __syscall_setsockopt" once per call.
-// Boost.Asio reads that as "this socket can't be configured" and refuses
-// to write the BT handshake - that's why our 19 connected TCP fds had
-// recv=0/send=0 across the board. Override with a strong symbol that
-// silently accepts everything. We don't have a real kernel here; the
-// rate-limit / NODELAY / KEEPALIVE knobs are no-ops over the WebVPN
-// tunnel anyway.
+// strong override for emscripten's weak stub, which returns -ENOPROTOOPT and makes Asio refuse to write
 extern "C" int __syscall_setsockopt(int /*fd*/, int /*level*/, int /*optname*/,
                                     int /*optval*/, int /*optlen*/, int /*dummy*/) {
   return 0;
@@ -58,9 +40,6 @@ extern "C" int __syscall_setsockopt(int /*fd*/, int /*level*/, int /*optname*/,
 
 #include "disk_io.hpp"
 
-// Traces are off unless the host turns them on. The per-second tick counter alone is a line
-// a second for the life of the session, which belongs in a console someone is deliberately
-// watching rather than in every user's.
 static bool g_log_enabled = false;
 
 #ifdef __EMSCRIPTEN__
@@ -80,27 +59,14 @@ struct session_state {
   std::unique_ptr<lt::io_context> ioc;
   std::unique_ptr<lt::session> ses;
 
-  // torrent_handle is heavy and not trivially copyable across the C boundary;
-  // we hand out small u32 ids and keep the real handles here.
   std::unordered_map<std::uint32_t, lt::torrent_handle> handles;
-  // Stable info-hash -> id map so add_magnet can return the SAME id the async
-  // add_torrent_alert will later register the real handle under (raw 20-byte
-  // key). Without this, add_* returns 0 while the handle is really 1+.
   std::unordered_map<std::string, std::uint32_t> hash_ids;
   std::uint32_t next_handle_id = 1;
 };
 
 session_state* g_session = nullptr;
 
-// Alerts get serialized into a length-prefixed binary stream so JS can pull
-// them in one shot per tick without bouncing back and forth. Each record is:
-//
-//   u32 type        (alert id, matches libtorrent's alert::type())
-//   u32 size        (size of payload that follows, in bytes)
-//   <payload>       (UTF-8 text for now - same as alert::message())
-//
-// Keeping this binary instead of JSON avoids the JSON-encode cost on hot
-// alerts like block_finished_alert.
+// wire format JS drains, per record: u32 type (alert::type()), u32 payload size, payload bytes
 struct alert_buffer {
   std::vector<std::uint8_t> data;
   void put_u32(std::uint32_t v) {
@@ -115,8 +81,7 @@ struct alert_buffer {
 
 alert_buffer g_pending_alerts;
 
-// Stable id for an info-hash: reuse the one add_magnet pre-allocated (or a prior
-// registration), else mint a fresh one. Keyed by the raw 20-byte hash string.
+// stable id for an info-hash: add_* and the later add_torrent_alert MUST resolve to the same id
 std::uint32_t id_for_hash(lt::sha1_hash const& key) {
   if (!g_session) return 0;
   auto const k = key.to_string();
@@ -129,8 +94,6 @@ std::uint32_t id_for_hash(lt::sha1_hash const& key) {
 
 std::uint32_t register_handle(lt::torrent_handle h) {
   if (!h.is_valid()) return 0;
-  // Map to the stable id for this info-hash (the one add_magnet returned), so a
-  // re-add or a duplicate add_torrent_alert resolves to the SAME id.
   auto const id = id_for_hash(h.info_hashes().get_best());
   g_session->handles[id] = std::move(h);
   return id;
@@ -141,22 +104,13 @@ lt::torrent_handle* lookup_handle(std::uint32_t id) {
   return it == g_session->handles.end() ? nullptr : &it->second;
 }
 
-// ---- streaming-read binary alert records ----------------------------------
-// JS can't read a torrent's file layout / piece bitfield through getters (they
-// sync_call → deadlock the single-threaded io_context). So we serialize the
-// streaming-critical data into the same length-prefixed alert stream JS already
-// drains, as typed binary records. Record ids avoid real libtorrent alert ids
-// (5/41/45/67/68) and the 0xFFFFFFFx diagnostic sentinels. All ints little-
-// endian (wasm32 LE; JS reads with DataView(..., true)).
+// record ids avoid real libtorrent alert ids (5/41/45/67/68) and the 0xFFFFFFFx diagnostic sentinels; all ints little-endian
 constexpr std::uint32_t REC_TORRENT_READY = 0xF0000001u;
 constexpr std::uint32_t REC_STATE_UPDATE  = 0xF0000002u;
 constexpr std::uint32_t REC_READ_PIECE    = 0xF0000003u;
 constexpr std::uint32_t REC_RESUME_DATA   = 0xF0000004u;
 
-// Resolve our u32 handle-id from a torrent's best info-hash - the JOIN key the
-// disk bridge stores per storage. info_hashes()/get_best() read m_torrent
-// directly (no sync_call; proven safe by lt_torrent_infohash). O(N) over a
-// handful of handles.
+// info_hashes()/get_best() read m_torrent directly, so unlike the other getters this does not sync_call
 std::uint32_t handle_id_for_hash(lt::sha1_hash const& key) {
   if (!g_session) return 0;
   for (auto const& [id, h] : g_session->handles)
@@ -170,15 +124,13 @@ void put_record(std::uint32_t type, std::vector<std::uint8_t> const& payload) {
   g_pending_alerts.put_bytes(payload.data(), payload.size());
 }
 
-// Returns false ONLY when the handle isn't registered yet (caller re-queues for
-// a later pump); true when emitted OR genuinely undeliverable (storage gone /
-// no metadata), which must NOT be retried.
+// returns false ONLY when the handle isn't registered yet (caller re-queues); true also covers undeliverable, which must NOT be retried
 bool emit_torrent_ready(std::uint32_t storage_index) {
   lt::wasm_storage_info si{};
   if (lt::wasm_disk_storage_info(storage_index, &si) != 0) return true;
   if (!si.fs || !si.fs->is_valid()) return true;
   std::uint32_t const hid = handle_id_for_hash(si.info_hash);
-  if (hid == 0) return false;  // handle not registered yet - retry next pump
+  if (hid == 0) return false;
   auto const* fs = si.fs;
   int const nf = fs->num_files();
   std::vector<std::uint8_t> p;
@@ -222,16 +174,10 @@ void emit_state_update(lt::state_update_alert const* sua) {
     i32(st.num_peers);
     i32(st.num_seeds);
     u32((st.flags & lt::torrent_flags::paused) ? 1u : 0u);
-    // `paused` on its own cannot say WHY a torrent stopped, and the three reasons want
-    // very different handling. auto_managed survives an error (update_state_list gates on
-    // is_auto_managed() && !has_error(), it does not clear the flag), so the pair splits
-    // cleanly: errc set is a failure, auto-managed without an error is the queue holding
-    // the torrent behind others, and neither is someone having pressed pause.
+    // auto_managed survives an error, so errc set is a failure while auto-managed without an error is the queue
     u32((st.flags & lt::torrent_flags::auto_managed) ? 1u : 0u);
     i32(static_cast<std::int32_t>(static_cast<int>(st.queue_position)));
     i32(st.errc ? st.errc.value() : 0);
-    // The message travels with the status, so a failure is attributed to the torrent that
-    // owns it rather than to whichever one happened to be nearby when an alert arrived.
     std::string const err = st.errc ? st.errc.message() : std::string();
     u32(static_cast<std::uint32_t>(err.size()));
     p.insert(p.end(), err.begin(), err.end());
@@ -239,8 +185,7 @@ void emit_state_update(lt::state_update_alert const* sua) {
     u32(static_cast<std::uint32_t>(nbytes));
     std::size_t const base = p.size();
     p.resize(base + static_cast<std::size_t>(nbytes), 0);
-    // MSB-first within each byte (bit 0 → 0x80 of byte 0) to match webtorrent +
-    // ripple's downloaded-ranges.ts.
+    // MSB-first within each byte (bit 0 → 0x80 of byte 0) to match webtorrent + ripple's downloaded-ranges.ts
     for (int i = 0; i < nbits; ++i)
       if (st.pieces.get_bit(i)) p[base + static_cast<std::size_t>(i / 8)] |= static_cast<std::uint8_t>(0x80u >> (i & 7));
     put_record(REC_STATE_UPDATE, p);
@@ -260,9 +205,6 @@ void emit_read_piece(lt::read_piece_alert const* rpa) {
   put_record(REC_READ_PIECE, p);
 }
 
-// Bencoded fast-resume blob (incl. the info-dict via save_info_dict, so a magnet
-// torrent re-adds without re-fetching metadata) keyed by our u32 handle id. JS
-// persists it and re-adds via lt_session_add_torrent_with_resume.
 void emit_resume_data(lt::save_resume_data_alert const* a) {
   std::uint32_t const hid = handle_id_for_hash(a->params.info_hashes.get_best());
   if (hid == 0) return;
@@ -274,11 +216,9 @@ void emit_resume_data(lt::save_resume_data_alert const* a) {
   put_record(REC_RESUME_DATA, p);
 }
 
-} // namespace
+}
 
-// ---- session lifecycle -----------------------------------------------------
-
-// Call before lt_session_create(); sockets read it at construction.
+// call before lt_session_create(); sockets read it at construction
 LT_API void lt_set_utp_receive_buffer(std::int32_t bytes) {
   if (bytes > 0) lt::aux::utp_receive_buffer_capacity = bytes;
 }
@@ -290,91 +230,41 @@ LT_API int lt_session_create() {
   g_session->ioc = std::make_unique<lt::io_context>();
 
   lt::settings_pack sp;
-  // Without at least one listen interface libtorrent has no listen_socket_t
-  // to use as the source for outgoing tracker/peer connects, so the entire
-  // network side stays idle. The bind itself goes through our JS shim
-  // (which returns success even if the WebVPN can't actually accept
-  // inbound), but the listen_socket_t entry is what tracker/UDP paths
-  // attach themselves to.
-  // A fixed, non-zero port so getsockname() returns it synchronously (the WebVPN
-  // bind is async, so a :0 request reads back as port 0 until the bound packet
-  // arrives - and libtorrent needs a valid local port up-front to bring up the
-  // listen_socket's receive loop). The relay binds its host socket ephemerally
-  // and reports 6882 back, so there's no host-port conflict between clients.
+  // one listen interface is required for outgoing connects, on a fixed non-zero port because the async bind reads back as 0 for :0
+  // no host-port conflict between clients: the relay binds its host socket ephemerally and reports 6882 back
   sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6882");
   sp.set_bool(lt::settings_pack::enable_upnp, false);
   sp.set_bool(lt::settings_pack::enable_natpmp, false);
   sp.set_bool(lt::settings_pack::enable_lsd, false);
-  // Throughput tuning. Browser environment: we have no kernel TCP buffers
-  // to feed into and our recv loop is paced by JS task scheduling rather
-  // than a real OS reactor, so the defaults (which assume a Linux box
-  // with native sockets) under-utilise what we can actually do.
-  //   - send/recv buffer watermarks: bump to keep more bytes in flight
-  //     between request and reply, especially helpful over the WebVPN
-  //     where the round-trip is iframe-relayed.
-  //   - max_out_request_queue: cap the per-peer outstanding request
-  //     count so a single laggy peer doesn't queue up MBs of work that
-  //     we won't process this second.
   sp.set_int(lt::settings_pack::send_buffer_watermark, 5 * 1024 * 1024);
   sp.set_int(lt::settings_pack::send_buffer_low_watermark, 512 * 1024);
   sp.set_int(lt::settings_pack::send_buffer_watermark_factor, 150);
-  // max_out_request_queue caps in-flight piece requests per peer. At
-  // 20+ MiB/s × default request_queue_time of 3s × 16 KiB blocks, the
-  // desired queue size hits ~4000 - old 1500 triggered the
-  // outstanding_request_limit_reached performance warning right before
-  // peers got "snubbed" because we couldn't keep them fed. Lift it.
+  // 5000: at 20+ MiB/s x the default request_queue_time of 3s x 16 KiB blocks the desired queue size reaches ~4000; the old 1500 tripped outstanding_request_limit_reached and got peers snubbed because we could not keep them fed
   sp.set_int(lt::settings_pack::max_out_request_queue, 5000);
   sp.set_int(lt::settings_pack::connections_limit, 500);
-  // Keep peers from being declared "snubbed" while we're processing a
-  // burst - defaults assume ~100ms response latency; our JS tick chain
-  // can stretch that under heavy load.
   sp.set_int(lt::settings_pack::peer_timeout, 240);
   sp.set_int(lt::settings_pack::request_timeout, 120);
-  // Speed up peer selection - defaults bias for long-running clients.
   sp.set_int(lt::settings_pack::unchoke_slots_limit, 32);
-  // The hot path is data movement, not bookkeeping. Disable the rate
-  // smoothing that introduces small artificial waits.
-  // prefer_tcp does NOT throttle uTP: it disables mixed-mode balancing and
-  // leaves the TCP peer class unlimited (rate limit 0 in second_tick).
-  // peer_proportional is the one that sets a rate limit, on the TCP class
-  // (webseeds included), proportional to the current total rate - with uTP
-  // collapsed on relay loss that clamped TCP to a fraction of an already
-  // broken rate. TCP rides reliable WT streams, so leave it uncapped.
+  // do not switch to peer_proportional: it rate-limits the TCP class (webseeds included), prefer_tcp leaves it uncapped
   sp.set_int(lt::settings_pack::mixed_mode_algorithm, lt::settings_pack::prefer_tcp);
-  // uTP LEDBAT target delay (ms). Over the WebVPN tunnel the *constant* relay
-  // latency reads as congestion at the default 100ms, collapsing cwnd to the
-  // floor. Loosen it so uTP keeps the window open (the tunnel jitter, not real
-  // path congestion, is what we're tolerating here).
+  // LEDBAT target delay (ms), loosened from the default 100 because the constant relay latency otherwise reads as congestion
   sp.set_int(lt::settings_pack::utp_target_delay, 600);
-  // uTP loss tolerance for the relay path: WT datagram drops arrive in bursts
-  // and are not a congestion signal from the real path, so soften the
-  // multiplicative cut and the cut cadence, keep RTOs from firing on relay
-  // jitter (an RTO resets cwnd to 1 MSS), and let established peers survive
-  // multi-second stalls instead of reconnecting back into slow start.
+  // WebTransport datagram drops arrive in bursts and are not a real-path congestion signal: soften the multiplicative cut and its cadence, keep RTOs (an RTO resets cwnd to 1 MSS) from firing on relay jitter, and let established peers survive multi-second stalls instead of reconnecting into slow start
   sp.set_int(lt::settings_pack::utp_loss_multiplier, 90);
   sp.set_int(lt::settings_pack::utp_cwnd_reduce_timer, 500);
   sp.set_int(lt::settings_pack::utp_min_timeout, 1200);
   sp.set_int(lt::settings_pack::utp_num_resends, 8);
   sp.set_int(lt::settings_pack::utp_syn_resends, 4);
   sp.set_int(lt::settings_pack::utp_gain_factor, 8000);
-  // Bootstrap hostnames resolve through the JS DoH resolver (patch 0001:
-  // js_resolver_async -> lt_dns_complete), so no resolver thread is spawned.
+  // safe under -sUSE_PTHREADS=0: the bootstrap hostnames resolve through the JS DoH resolver (patch 0001: js_resolver_async -> lt_dns_complete), so libtorrent spawns no resolver thread
   sp.set_bool(lt::settings_pack::enable_dht, true);
   sp.set_str(lt::settings_pack::dht_bootstrap_nodes,
       "dht.libtorrent.org:25401,router.bittorrent.com:6881,"
       "router.utorrent.com:6881,dht.transmissionbt.com:6881");
-  // Force the disk/hashing pools to size 0 so nothing tries pthread_create.
-  // Our wasm_disk_io ignores these anyway, but settings_pack init paths
-  // may still touch them.
+  // pools MUST stay at 0 so nothing tries pthread_create
   sp.set_int(lt::settings_pack::aio_threads, 0);
   sp.set_int(lt::settings_pack::hashing_threads, 0);
-  // Pull the production-relevant categories. The *_log categories
-  // (session_log, torrent_log, peer_log, dht_log, picker_log) were on
-  // earlier for diagnosis but each emits dozens of message-rich alerts
-  // per tick once a torrent is active - the alert queue grows, every
-  // call to pop_alerts walks more entries, and the JS thread spends
-  // most of its time draining them. Off by default; flip via
-  // lt_session_set_log_verbose() when actively debugging.
+  // the *_log categories (session_log, torrent_log, peer_log, dht_log, picker_log) are deliberately absent: each emits dozens of message-rich alerts per tick once a torrent is active, so pop_alerts walks an ever-growing queue and the JS thread spends most of its time draining; enable via lt_session_set_log_verbose() when actively debugging, never by default
   sp.set_int(lt::settings_pack::alert_mask,
       lt::alert_category::error
     | lt::alert_category::peer
@@ -390,20 +280,11 @@ LT_API int lt_session_create() {
   lt::session_params params(sp);
   params.disk_io_constructor = lt::wasm_disk_io_constructor;
 
-  // Hand the session our io_context so we can drive .poll() from tick.
-  // This is the single-threaded path; the session will not spawn its own
-  // network thread.
   LT_LOG("[lt] constructing session…");
   g_session->ses = std::make_unique<lt::session>(std::move(params), *g_session->ioc);
   LT_LOG("[lt] session constructed");
 
-  // Some session_impl init paths still try to spawn a worker thread (e.g.
-  // boost.asio's resolver service, ip_change_notifier on Linux), which
-  // fails under -sUSE_PTHREADS=0. session_impl::wrap() catches the
-  // resulting system_error and calls pause(). Resume immediately so the
-  // session actually does work - the failed thread spawn doesn't break
-  // anything else, it just means the corresponding optional facility (DNS
-  // worker, NIC-change watcher) is unavailable.
+  // required: a thread spawn fails under -sUSE_PTHREADS=0 and session_impl::wrap() reacts by pausing the session
   g_session->ses->resume();
 
   return 0;
@@ -419,25 +300,12 @@ LT_API void lt_session_destroy() {
   g_session = nullptr;
 }
 
-// Run all currently-ready handlers and return. Never blocks.
-//
-// JS schedules subsequent ticks when something becomes ready:
-//   - new bytes arrive on a TCP/UDP socket
-//   - a disk job completes
-//   - a timer expires
-// Combined with non-blocking sockets, this gives us an event-driven loop
-// without Asyncify.
-// Tick stats - readable via lt_diag_*().
 static std::int64_t g_tick_count = 0;
 static std::int64_t g_total_handlers = 0;
 
 LT_API std::int64_t lt_diag_tick_count() { return g_tick_count; }
 LT_API std::int64_t lt_diag_total_handlers() { return g_total_handlers; }
 
-// Direct test: open a TCP socket via Asio (bypasses libtorrent). If FKN_socket
-// fires after this, the bridge works and the issue is in libtorrent's
-// listen-socket setup. If it doesn't fire, the issue is Asio/Emscripten's
-// socket service.
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ip/udp.hpp>
 LT_API int lt_diag_open_tcp() {
@@ -455,8 +323,6 @@ LT_API int lt_diag_open_tcp() {
   }
 }
 
-// Full chain: acceptor.open + bind + listen - exactly what session_impl does
-// in setup_listener.
 LT_API int lt_diag_listen_full() {
   if (!g_session) return -1;
   try {
@@ -493,13 +359,11 @@ LT_API int lt_diag_open_udp() {
   }
 }
 
-// Trigger a listen_port query - this round-trips through the io_context.
 LT_API int lt_diag_listen_port() {
   if (!g_session) return -1;
   return g_session->ses->listen_port();
 }
 
-// Force reopen_listen_sockets by posting a new settings update.
 LT_API void lt_diag_force_reopen() {
   if (!g_session) return;
   lt::settings_pack sp;
@@ -507,8 +371,6 @@ LT_API void lt_diag_force_reopen() {
   g_session->ses->apply_settings(std::move(sp));
 }
 
-// Test the parse: returns how many interfaces parse_listen_interfaces
-// produced for the given string, plus push errors into the alert stream.
 #include "libtorrent/string_util.hpp"
 LT_API int lt_diag_parse_interfaces(char const* str) {
   if (!str) return -1;
@@ -520,7 +382,6 @@ LT_API int lt_diag_parse_interfaces(char const* str) {
     g_pending_alerts.put_u32(static_cast<std::uint32_t>(msg.size()));
     g_pending_alerts.put_bytes(msg.data(), msg.size());
   }
-  // Echo result via alerts.
   for (auto const& i : ifaces) {
     std::string msg = "iface: device=" + i.device + " port=" + std::to_string(i.port)
                     + " ssl=" + (i.ssl ? "1" : "0") + " local=" + (i.local ? "1" : "0");
@@ -531,37 +392,14 @@ LT_API int lt_diag_parse_interfaces(char const* str) {
   return static_cast<int>(ifaces.size());
 }
 
-// Per-tick handler budget. io_context::poll() would otherwise drain the
-// entire ready queue in one synchronous call - when libtorrent kicks off a
-// torrent it posts hundreds of handlers at once and a single tick can pin
-// the main thread for 100s of ms. Capping forces JS to get control back
-// between batches; the JS side rearms scheduleTick when this returns the
-// budget cap (meaning more work likely waiting).
-//
-// Drain handlers in a time-budgeted loop: keep calling poll() (which
-// processes all currently-ready handlers in one shot) as long as more
-// work appears, capped at ~8ms to leave the renderer breathing room.
-// Without the loop, work that becomes ready DURING the tick (e.g. a
-// handler that posts another handler) has to wait a full JS task round-
-// trip to be picked up. Browser task rate is ~150-200/sec under load
-// so each spared round-trip is worth it.
 LT_API int lt_session_tick() {
   if (!g_session) return 0;
-  // Keep the io_context from "stopping" when the only pending work is an
-  // outstanding async_wait (e.g. the UDP socket's readability wait). Without
-  // this, poll() returns immediately without ever servicing the select-reactor
-  // on Emscripten, so on_udp_packet never fires and inbound UDP is wedged.
+  // without the guard poll() returns without servicing the select-reactor on Emscripten, wedging inbound UDP
   static auto work_guard = boost::asio::make_work_guard(g_session->ioc->get_executor());
   std::size_t ran = 0;
   try {
     auto const start = std::chrono::steady_clock::now();
-    // Worker variant: libtorrent runs in a dedicated Worker, so the
-    // renderer never sees this tick. The only thing it shares time with
-    // is the @fkn/lib dgram socket's 'message' handler. A 100 ms cap is
-    // generous enough to let libtorrent burn down a full burst of
-    // pending blocks without ping-pong; smaller budgets bounce control
-    // back to JS between tiny batches, capping throughput well below
-    // what the network is feeding us.
+    // 100 ms is deliberately generous because libtorrent runs in a dedicated Worker the renderer never sees; smaller budgets bounce control back to JS between tiny batches and cap throughput below what the network feeds us, so do not lower it
     auto const deadline = start + std::chrono::milliseconds(100);
     while (true) {
       std::size_t const n = g_session->ioc->poll();
@@ -571,8 +409,6 @@ LT_API int lt_session_tick() {
     }
     g_total_handlers += static_cast<std::int64_t>(ran);
     ++g_tick_count;
-    // 1-second-window stats so we can see where wallclock goes:
-    //   tick_us / handlers_processed / ticks_in_window
     static auto window_start = start;
     static std::int64_t window_tick_us = 0;
     static std::int64_t window_ticks = 0;
@@ -606,25 +442,16 @@ LT_API int lt_session_tick() {
     g_pending_alerts.put_u32(static_cast<std::uint32_t>(m.size()));
     g_pending_alerts.put_bytes(m.data(), m.size());
   }
-  // restart() clears the stopped flag so the next poll() will work again.
   g_session->ioc->restart();
   return static_cast<int>(ran);
 }
 
-// Returns ms until the next libtorrent-internal timer would fire, capped at
-// `max_ms`. JS uses this as the setTimeout fallback when no socket/disk
-// activity is pumping ticks. -1 means "no upcoming timer" (use a long sleep).
+// placeholder: asio exposes no "time to next timer", so max_ms is deliberately ignored and a fixed 250 returned; -1 means no upcoming timer (use a long sleep)
 LT_API int lt_session_next_timer_ms(int max_ms) {
   if (!g_session) return -1;
-  // boost::asio doesn't directly expose "time to next timer". The cheap
-  // approximation is to ask the session to post a status update on the next
-  // tick (it will, internally, ping any expired timers). For now we surface
-  // a fixed upper bound; future iterations can wire in the precise value.
   (void)max_ms;
   return 250;
 }
-
-// ---- alerts ---------------------------------------------------------------
 
 LT_API void lt_session_pump_alerts() {
   if (!g_session) return;
@@ -632,8 +459,6 @@ LT_API void lt_session_pump_alerts() {
   g_session->ses->pop_alerts(&alerts);
 
   for (auto* a : alerts) {
-    // state_update / read_piece carry their data in a binary record only - skip
-    // the generic text dup (read_piece's message() stringifies the whole piece).
     if (auto* sua = lt::alert_cast<lt::state_update_alert>(a)) { emit_state_update(sua); continue; }
     if (auto* rpa = lt::alert_cast<lt::read_piece_alert>(a)) { emit_read_piece(rpa); continue; }
     if (auto* srda = lt::alert_cast<lt::save_resume_data_alert>(a)) { emit_resume_data(srda); continue; }
@@ -644,19 +469,11 @@ LT_API void lt_session_pump_alerts() {
     g_pending_alerts.put_u32(static_cast<std::uint32_t>(msg.size()));
     g_pending_alerts.put_bytes(msg.data(), msg.size());
 
-    // When a torrent is added, libtorrent posts an add_torrent_alert carrying
-    // the handle. That's the only place we learn about handles for things we
-    // didn't add through our wrapper (e.g. resume data). Keep its text record
-    // (small + useful for diagnostics).
     if (auto* ata = lt::alert_cast<lt::add_torrent_alert>(a))
       register_handle(ata->handle);
   }
 
-  // Drain storages whose file_storage became available and emit the handle-keyed
-  // torrent-ready record. Done AFTER the loop so the handle (registered above at
-  // add_torrent_alert, possibly an earlier tick for a magnet) resolves by
-  // info-hash. Any storage whose handle isn't registered yet is RE-QUEUED for a
-  // later pump (never dropped - see emit_torrent_ready).
+  // must run AFTER the loop above, so a handle registered from add_torrent_alert resolves by info-hash
   std::uint32_t ready[32];
   std::vector<std::uint32_t> deferred;
   for (int n; (n = lt::wasm_disk_take_ready(ready, 32)) > 0; )
@@ -677,14 +494,7 @@ LT_API void lt_alerts_clear() {
   g_pending_alerts.data.clear();
 }
 
-// ---- torrents -------------------------------------------------------------
-
-// Add a torrent from a magnet URI. Returns the (stable) handle id, pre-allocated
-// from the magnet's info-hash so JS gets the handle synchronously even though the
-// real torrent_handle only arrives async via add_torrent_alert (which registers
-// under the SAME id). add_torrent itself must be async: session_handle::add_torrent
-// is a blocking sync_call waiting on the io_context, but our io_context only runs
-// when JS calls _lt_session_tick(), so a sync add deadlocks instantly.
+// the add MUST stay async: the sync add_torrent is a sync_call on an io_context only JS ticks, so it deadlocks
 LT_API int lt_session_add_magnet(char const* magnet, char const* save_path) {
   if (!g_session || !magnet) return -1;
   lt::error_code ec;
@@ -696,7 +506,6 @@ LT_API int lt_session_add_magnet(char const* magnet, char const* save_path) {
   return static_cast<int>(id);
 }
 
-// Add a torrent from a .torrent file buffer. Same async semantics as above.
 LT_API int lt_session_add_torrent_file(
     std::uint8_t const* buf, std::uint32_t len, char const* save_path) {
   if (!g_session || !buf || !len) return -1;
@@ -721,8 +530,6 @@ LT_API int lt_session_remove_torrent(std::uint32_t id) {
   return 0;
 }
 
-// Remove from the session, optionally deleting the downloaded files from storage
-// (OPFS). delete_files != 0 → also wipe the data; otherwise files stay for later.
 LT_API int lt_session_remove_torrent_ex(std::uint32_t id, int delete_files) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -734,8 +541,7 @@ LT_API int lt_session_remove_torrent_ex(std::uint32_t id, int delete_files) {
   return 0;
 }
 
-// Pause: unset auto_managed first so the queue logic doesn't auto-resume it, then
-// pause (disconnects peers, stops up+down - i.e. also stops seeding).
+// order matters: unset auto_managed first or the queue logic auto-resumes it
 LT_API int lt_torrent_pause(std::uint32_t id) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -754,11 +560,7 @@ LT_API int lt_torrent_resume(std::uint32_t id) {
   return 0;
 }
 
-// Re-verify every piece against what is actually on disk, for when the files and the
-// recorded have-set have drifted apart. libtorrent forgets the have-set first and only
-// schedules the hash pass for a torrent that is neither paused nor errored
-// (should_check_files), so clearing both is what makes the check run rather than sit. It
-// reports progress through the usual status updates while state is checking_files.
+// should_check_files only schedules the hash pass for a torrent that is neither paused nor errored, hence the resume first
 LT_API int lt_torrent_force_recheck(std::uint32_t id) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -769,8 +571,6 @@ LT_API int lt_torrent_force_recheck(std::uint32_t id) {
   return 0;
 }
 
-// Ask libtorrent to snapshot fast-resume state; arrives async as a
-// save_resume_data_alert → REC_RESUME_DATA. save_info_dict embeds the metadata.
 LT_API int lt_torrent_save_resume_data(std::uint32_t id) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -779,10 +579,7 @@ LT_API int lt_torrent_save_resume_data(std::uint32_t id) {
   return 0;
 }
 
-// Re-add a torrent from a bencoded fast-resume blob. no_verify_files makes
-// libtorrent TRUST the resume have-bitmask against the OPFS files → no recheck,
-// no network re-download (complete torrents go straight to seeding). Returns the
-// stable handle id (pre-allocated from the resume info-hash).
+// no_verify_files makes libtorrent TRUST the resume have-bitmask against the files on disk: no recheck, no re-download
 LT_API int lt_session_add_torrent_with_resume(
     std::uint8_t const* buf, std::uint32_t len, char const* save_path) {
   if (!g_session || !buf || !len) return -1;
@@ -797,8 +594,7 @@ LT_API int lt_session_add_torrent_with_resume(
   return static_cast<int>(hid);
 }
 
-// Returns 0 on success and fills `out`. Layout matches js/index.ts.
-// Kept POD-flat so JS can read it as a struct via DataView.
+// POD-flat layout, read field by field via DataView in js/index.ts
 struct torrent_status_out {
   std::int32_t  state;
   std::int32_t  paused;
@@ -820,13 +616,7 @@ struct torrent_status_out {
   std::int32_t  has_metadata;
 };
 
-// Status query - non-blocking. Requests a status update; the result arrives
-// as a state_update_alert that JS can pull through pump_alerts. We can't
-// call h->status() directly here because it's a sync_call that waits on a
-// condition variable for the io_context to process the dispatched lambda,
-// and our io_context only runs when JS ticks (single-threaded, external
-// io_context). All synchronous session APIs in libtorrent have this
-// constraint.
+// never call h->status() instead: every synchronous libtorrent getter sync_calls an io_context that only runs when JS ticks
 LT_API int lt_torrent_post_status(std::uint32_t id) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -835,13 +625,13 @@ LT_API int lt_torrent_post_status(std::uint32_t id) {
   return 0;
 }
 
-// Stub kept for ABI compatibility; always returns -1 in the async model.
+// stub kept for ABI compatibility; always returns -1 in the async model
 LT_API int lt_torrent_status(std::uint32_t id, torrent_status_out* out) {
   (void)id; (void)out;
   return -1;
 }
 
-// Hex-encoded infohash; writes up to 41 bytes (40 hex + NUL) into `out`.
+// writes 41 bytes into `out`: 40 hex + NUL
 LT_API int lt_torrent_infohash(std::uint32_t id, char* out) {
   if (!g_session || !out) return -1;
   auto* h = lookup_handle(id);
@@ -853,14 +643,7 @@ LT_API int lt_torrent_infohash(std::uint32_t id, char* out) {
   return 0;
 }
 
-// ---- streaming commands ---------------------------------------------------
-// All async_call on torrent_handle → safe under the single-threaded io_context
-// (unlike the *getters*, which sync_call → deadlock). The TS read() layer uses
-// these to prioritize + deadline the pieces covering a requested byte range so
-// a seek is served quickly instead of waiting for sequential download.
-
-// Toggle sequential download. set_sequential_download() is ABI-v1-only; the
-// modern path is set/unset_flags(sequential_download).
+// set_sequential_download() is ABI-v1-only; the modern path is set/unset_flags(sequential_download)
 LT_API int lt_torrent_set_sequential(std::uint32_t id, int on) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -870,7 +653,6 @@ LT_API int lt_torrent_set_sequential(std::uint32_t id, int on) {
   return 0;
 }
 
-// Request a whole piece's bytes; delivered as a read_piece_alert (→ REC_READ_PIECE).
 LT_API int lt_torrent_read_piece(std::uint32_t id, std::int32_t piece) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -879,8 +661,6 @@ LT_API int lt_torrent_read_piece(std::uint32_t id, std::int32_t piece) {
   return 0;
 }
 
-// Prioritize a piece with a deadline (ms). alert_when_available != 0 also posts
-// a read_piece_alert once the piece lands - the signal the TS read() awaits.
 LT_API int lt_torrent_set_piece_deadline(std::uint32_t id, std::int32_t piece,
                                          std::int32_t deadline_ms, int alert_when_available) {
   if (!g_session) return -1;
@@ -900,8 +680,7 @@ LT_API int lt_torrent_clear_piece_deadlines(std::uint32_t id) {
   return 0;
 }
 
-// Set per-piece download priority for pieces [0, count) from a byte array
-// (0=skip, 1=low, 4=default, 7=top). Pieces beyond `count` keep their priority.
+// prios encoding: 0=skip, 1=low, 4=default, 7=top; pieces beyond `count` keep their priority
 LT_API int lt_torrent_prioritize_pieces(std::uint32_t id,
                                         std::uint8_t const* prios, std::uint32_t count) {
   if (!g_session || !prios) return -1;

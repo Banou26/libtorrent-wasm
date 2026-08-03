@@ -1,13 +1,4 @@
-// Custom disk_interface that hands work to JS via EM_JS imports.
-//
-// Each storage (torrent) gets a `storage_index_t`. Each async job gets a
-// monotonic u64 id, registered in g_pending until JS calls back through the
-// lt_disk_complete_* shims, at which point we look up the handler and post
-// it onto the io_context (so the callback runs on the libtorrent thread,
-// holding none of our locks).
-//
-// Hashing is local. We never send block data to JS just to compute a SHA;
-// JS only sees opaque read-this/write-this requests.
+// Completions post onto the io_context, so the callback runs on the libtorrent thread, holding none of our locks.
 
 #include "disk_io.hpp"
 
@@ -35,27 +26,18 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 
-// JS-side glue. These functions live in js/library_fkn.js and ultimately call
-// app-provided handlers wired up in js/index.ts. They MUST be non-blocking:
-// they kick off async work in JS and return; completion arrives via
-// lt_disk_complete_* on a later tick.
+// These MUST be non-blocking: completion arrives via lt_disk_complete_* on a later tick.
 extern "C" {
-  // Notify JS that a new torrent's storage is in play. file_list is a JSON
-  // array of {path, size}; JS uses it to lay out OPFS files or to remember
-  // the layout for read/write handlers.
+  // file_list_json is a JSON array of {path, size} objects, hand-written by notify_js_new and JSON.parsed on the JS side
   void js_disk_new_storage(int storage_id, char const* save_path,
                            char const* file_list_json, int file_list_len);
   void js_disk_remove_storage(int storage_id);
 
-  // Read `len` bytes from (file_index, offset) for `storage_id`. On
-  // completion, JS calls lt_disk_complete_read(job_id, ptr, len, err). The
-  // ptr must be allocated inside the WASM heap (the JS shim allocates via
-  // _malloc and we _free after copying).
+  // The completion ptr must be allocated inside the WASM heap (the JS shim uses _malloc, we _free after copying).
   void js_disk_read(int storage_id, std::uint64_t job_id,
                     int file_index, std::int64_t offset, std::int32_t len);
 
-  // Write `len` bytes starting at `data` to (file_index, offset). JS reads
-  // the buffer inline before returning, so the caller can free / overwrite.
+  // JS reads the buffer inline before returning, so the caller can free / overwrite.
   void js_disk_write(int storage_id, std::uint64_t job_id,
                      int file_index, std::int64_t offset,
                      std::uint8_t const* data, std::int32_t len);
@@ -70,7 +52,6 @@ extern "C" {
 }
 
 #else
-// Stubs so the file still builds outside Emscripten (e.g. for editor checks).
 static inline void js_disk_new_storage(int, char const*, char const*, int) {}
 static inline void js_disk_remove_storage(int) {}
 static inline void js_disk_read(int, std::uint64_t, int, std::int64_t, std::int32_t) {}
@@ -88,28 +69,18 @@ namespace libtorrent {
 
 namespace {
 
-// Storage table: maps libtorrent's storage_index_t to per-torrent state.
-// The file_storage is referenced (not copied) - it is owned by the torrent
-// and outlives our entry because remove_torrent on this object is called
-// before the torrent goes away.
 struct storage_entry {
   file_storage const* fs;
   std::string save_path;
-  // Number of files; cached so we can validate file_index without
-  // re-locking the torrent.
   int num_files;
-  // == storage_params.info_hash == handle.info_hashes().get_best(); the key the
-  // wrapper joins a storage_index to its torrent_handle / handle-id by.
+  // the key the wrapper joins a storage_index to its torrent_handle / handle-id by
   sha1_hash info_hash;
 };
 
 struct wasm_disk_io;
 wasm_disk_io* g_disk_io = nullptr;
 
-// storage_index values whose file_storage just became available (notify_js_new
-// fired). Drained by the wrapper each pump to emit torrent-ready alert records.
-// Lives here (disk side) because only the disk_io is handed the populated
-// file_storage - post-metadata, so it works for magnets too.
+// Drained by the wrapper each pump to emit torrent-ready alert records.
 std::vector<std::uint32_t> g_storage_ready_queue;
 
 struct read_job {
@@ -164,8 +135,6 @@ struct wasm_disk_io final
     g_storage_ready_queue.clear();
   }
 
-  // ---- bookkeeping -------------------------------------------------------
-
   std::uint64_t next_job_id() { return ++m_job_seq; }
 
   storage_holder new_torrent(storage_params const& p,
@@ -182,17 +151,12 @@ struct wasm_disk_io final
   }
 
   void remove_torrent(storage_index_t idx) override {
-    // Drop the file_storage pointer - it aliases the torrent_info, freed when the
-    // torrent goes away; query_storage's `!fs` guard then fails safe instead of
-    // dereferencing a dangling pointer.
+    // Drop the file_storage pointer - it aliases the torrent_info; query_storage's `!fs` guard then fails safe.
     auto const i = static_cast<std::size_t>(static_cast<int>(idx));
     if (i < m_storages.size()) m_storages[i].fs = nullptr;
     js_disk_remove_storage(static_cast<int>(idx));
-    // We don't reclaim the slot - storage_index_t is sparse-tolerant and
-    // sessions don't typically churn through millions of torrents.
+    // We don't reclaim the slot - storage_index_t is sparse-tolerant.
   }
-
-  // ---- the heavy paths: read / write -------------------------------------
 
   void async_read(storage_index_t idx, peer_request const& r,
       std::function<void(disk_buffer_holder, storage_error const&)> handler,
@@ -227,10 +191,6 @@ struct wasm_disk_io final
                    s.offset, static_cast<std::int32_t>(s.size));
       return;
     }
-    // Multi-slice: piece spans file boundaries. Allocate one combined
-    // buffer up front and have each sub-read drop its slice in. When
-    // every sub-read has reported, hand the buffer off to libtorrent
-    // wrapped as a disk_buffer_holder (free_disk_buffer calls std::free).
     auto* combined = static_cast<std::uint8_t*>(std::malloc(r.length));
     auto remaining = std::make_shared<std::atomic<int>>(static_cast<int>(slices.size()));
     auto first_err = std::make_shared<std::atomic<int>>(0);
@@ -301,9 +261,6 @@ struct wasm_disk_io final
                     static_cast<std::int32_t>(s.size));
       return false;
     }
-    // Multi-slice: fan out a sub-write per file slice. Each sub-write
-    // gets its own job id; when the last one completes we fire the
-    // libtorrent handler (first error wins).
     auto remaining = std::make_shared<std::atomic<int>>(static_cast<int>(slices.size()));
     auto first_err = std::make_shared<std::atomic<int>>(0);
     auto shared_obs = std::shared_ptr<disk_observer>(std::move(obs));
@@ -334,16 +291,10 @@ struct wasm_disk_io final
     return false;
   }
 
-  // ---- hashing - done locally, no JS bounce ------------------------------
-
   void async_hash(storage_index_t idx, piece_index_t piece,
       span<sha256_hash> v2, disk_job_flags_t flags,
       std::function<void(piece_index_t, sha1_hash const&, storage_error const&)> handler) override
   {
-    // Hashing a piece requires reading it back. We schedule a synthetic
-    // read across the full piece span and SHA it in-memory once the read
-    // completes. For now we fault to JS for the read; future revisions
-    // could keep a writeback cache so freshly-written pieces hash from RAM.
     auto* se = storage_at(idx);
     if (!se) {
       post(m_ios, [handler, piece] {
@@ -355,9 +306,6 @@ struct wasm_disk_io final
     }
     int const piece_size = se->fs->piece_size(piece);
     auto buf = std::make_shared<std::vector<char>>(piece_size);
-    // Hashing kicks off a chain of small reads (one per block boundary
-    // is enough; here we issue one big read for the whole piece - JS may
-    // internally split it across files).
     peer_request r;
     r.piece = piece;
     r.start = 0;
@@ -369,7 +317,6 @@ struct wasm_disk_io final
           handler(piece, sha1_hash{}, ec);
           return;
         }
-        // Copy out; holder will be released as soon as we return.
         std::memcpy(buf->data(), holder.data(), buf->size());
 
         sha1_hash sha1;
@@ -379,7 +326,6 @@ struct wasm_disk_io final
           sha1 = h.final();
         }
 
-        // v2 block hashes (16 KiB SHA-256 per block).
         constexpr int block = default_block_size;
         int const n_blocks = static_cast<int>((buf->size() + block - 1) / block);
         if (!v2.empty()) {
@@ -427,8 +373,6 @@ struct wasm_disk_io final
         handler(piece, h.final(), storage_error{});
       }, {});
   }
-
-  // ---- everything else: simple bounces to JS -----------------------------
 
   void async_move_storage(storage_index_t idx, std::string p, move_flags_t,
       std::function<void(status_t, std::string const&, storage_error const&)> handler) override
@@ -519,8 +463,6 @@ struct wasm_disk_io final
     post(m_ios, [h = std::move(handler), index] { h(index); });
   }
 
-  // ---- JS → C++ completion hooks (called from library_fkn.js) ----------
-
   void complete_read(std::uint64_t job_id, std::uint8_t* data, std::int32_t len,
                      std::int32_t err) {
     pending_job pj;
@@ -540,8 +482,6 @@ struct wasm_disk_io final
             error_code(err, system_category()),
             operation_t::file_read});
       } else {
-        // Wrap the JS-malloc'd buffer in a disk_buffer_holder backed by
-        // *this* allocator; free_disk_buffer is what releases it.
         handler(disk_buffer_holder(*this, reinterpret_cast<char*>(data), len),
                 storage_error{});
       }
@@ -658,15 +598,10 @@ struct wasm_disk_io final
     }
   }
 
-  // ---- buffer_allocator_interface ---------------------------------------
-
+  // must stay a plain std::free: read buffers come from JS via _malloc (and the multi-slice combined buffer from std::malloc), so a pool or another allocator corrupts the WASM heap
   void free_disk_buffer(char* buf) override {
-    // Buffers handed back from JS were allocated via _malloc; release them
-    // here so the WASM heap doesn't leak.
     std::free(buf);
   }
-
-  // ---- misc interface bits ----------------------------------------------
 
   void update_stats_counters(counters& c) const override {
     c.set_value(counters::disk_blocks_in_use,
@@ -678,8 +613,6 @@ struct wasm_disk_io final
   }
 
   void abort(bool) override {
-    // Pending jobs are dropped silently - JS may still call back, but
-    // complete_* will find no entry and return.
     std::lock_guard<std::mutex> g(m_mu);
     m_pending.clear();
   }
@@ -687,7 +620,6 @@ struct wasm_disk_io final
   void settings_updated() override {}
   void submit_jobs() override {}
 
-  // Deadlock-free geometry lookup for the streaming-read bridge (wrapper.cpp).
   bool query_storage(std::uint32_t idx, wasm_storage_info& out) const {
     auto* se = storage_at(storage_index_t{idx});
     if (!se || !se->fs) return false;
@@ -707,12 +639,6 @@ private:
                  int& file_index, std::int64_t& file_offset) const {
     auto* se = storage_at(idx);
     if (!se) { file_index = -1; file_offset = 0; return; }
-    // map_block returns a list of (file, offset, size) slices the request
-    // overlaps. For the minimal first cut we just take the first one -
-    // that's correct for reads/writes that stay within a single file
-    // (the overwhelming majority once aligned to block boundaries). Truly
-    // cross-file spans will be handled in a follow-up by issuing N slice
-    // jobs and aggregating their completions.
     auto slices = se->fs->map_block(piece, start_offset, 1);
     if (slices.empty()) { file_index = -1; file_offset = 0; return; }
     file_index  = static_cast<int>(slices.front().file_index);
@@ -721,8 +647,6 @@ private:
 
   void notify_js_new(int storage_id) {
     auto const& se = m_storages[storage_id];
-    // Build a tiny JSON description of files. We avoid pulling a full JSON
-    // library - write it by hand. file_storage::file_name returns string_view.
     std::string json = "[";
     for (file_index_t i{0}; i < file_index_t{se.num_files}; ++i) {
       if (static_cast<int>(i) > 0) json += ',';
@@ -739,8 +663,6 @@ private:
     json += "]";
     js_disk_new_storage(storage_id, se.save_path.c_str(),
                         json.c_str(), static_cast<int>(json.size()));
-    // Signal the wrapper (next pump) that this storage's geometry is ready, so
-    // it can emit the handle-keyed torrent-ready alert record.
     g_storage_ready_queue.push_back(static_cast<std::uint32_t>(storage_id));
   }
 
@@ -779,10 +701,6 @@ std::unique_ptr<disk_interface> wasm_disk_io_constructor(
 }
 
 } // namespace libtorrent
-
-// ---- C ABI for JS-side completion callbacks --------------------------------
-// JS calls these via _lt_disk_complete_* after fulfilling a request. The
-// signatures mirror the storage_error mapping in wasm_disk_io::complete_*.
 
 extern "C" EMSCRIPTEN_KEEPALIVE
 void lt_disk_complete_read(std::uint64_t job_id, std::uint8_t* data,

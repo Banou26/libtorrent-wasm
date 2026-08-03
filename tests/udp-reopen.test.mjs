@@ -1,11 +1,5 @@
 // The UDP socket under a fd does not survive losing the connection, and nothing above the
-// shim can see that happen: a dead socket still accepts send(), and an empty receive queue
-// looks exactly like a quiet one. These cover the shim healing itself.
-//
-// Loads src/library_fkn.js directly (it is an addToLibrary({...}) object literal) with a
-// fake dgram, so none of this needs emscripten or the wasm.
-//
-// Run: node --test tests/udp-reopen.test.mjs
+// shim can see that happen: a dead socket still accepts send(). These cover the shim healing itself.
 
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -17,8 +11,6 @@ import test from 'node:test'
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'src', 'library_fkn.js'), 'utf8')
 
-// A dgram stand-in that records every socket handed out, so a test can assert that a
-// replacement was created and where it bound.
 const makeDgram = () => {
   const sockets = []
   return {
@@ -38,7 +30,6 @@ const makeDgram = () => {
   }
 }
 
-// Evaluates the library object with the globals emscripten would provide.
 const loadShim = (dgram) => {
   const heap = new Uint8Array(1 << 16)
   let library
@@ -51,8 +42,7 @@ const loadShim = (dgram) => {
     new Uint16Array(heap.buffer), new Uint32Array(heap.buffer),
     { now: () => 0 }, { log() {}, warn() {}, error() {} })
 
-  // Emscripten emits `$FKN` as a module-level `var FKN`, so the member functions refer to
-  // the bare identifier. Nothing binds it here, so put it where their scope chain looks.
+  // Emscripten emits `$FKN` as a module-level `var FKN`, so the member functions refer to the bare identifier
   const FKN = library.$FKN
   globalThis.FKN = FKN
   // $FKN__postset is what fills the fd table at link time; there is no linker here.
@@ -64,11 +54,9 @@ const loadShim = (dgram) => {
   return { FKN, library, heap }
 }
 
-// Timers outlive the test that scheduled them, and every shim shares one global FKN, so a
-// straggler from a finished test would otherwise build a socket inside the next one.
+// Timers outlive the test that scheduled them, and every shim shares one global FKN
 const settled = (st) => { st.closed = true }
 
-// Builds the udp fd state the way FKN_socket does, then binds it the way FKN_bind does.
 const boundUdpState = (FKN) => {
   const st = { kind: 'udp', family: 'IPv4', nonblock: false, socket: null, udpRecv: [], reopenAttempts: 0 }
   FKN._dbgWorkerUdpPkts = 0
@@ -90,7 +78,6 @@ test('a closed socket is replaced and re-bound to the same port', async () => {
   const st = boundUdpState(FKN)
   assert.equal(dgram.sockets.length, 1)
 
-  // What losing the connection actually looks like: fkn's dgram emits error then close.
   st.socket.emit('error', Object.assign(new Error('WebVPN session closed'), { errno: 5 }))
   st.socket.emit('close')
   assert.equal(st.dead, true, 'the socket is marked dead straight away')
@@ -126,7 +113,7 @@ test('sends report EAGAIN while the socket is gone instead of claiming success',
   const st = boundUdpState(FKN)
   const fd = FKN.newFd(st)
 
-  // A sockaddr_in for 1.2.3.4:6881, which is what libtorrent hands sendto.
+  // A sockaddr_in for 1.2.3.4:6881
   const addrPtr = 1024
   heap[addrPtr] = 2
   heap[addrPtr + 1] = 0
@@ -160,14 +147,13 @@ test('repeated failures back off, and traffic resets the schedule', async () => 
 
   st.socket.emit('close')
   await new Promise((resolve) => setTimeout(resolve, 400))
-  // The second delay is a second long, so nothing has been rebuilt yet at 400ms.
+  // 400 is chosen against UDP_REOPEN_DELAYS[1] = 1000: the second delay is a full second, so nothing has been rebuilt yet at 400ms, and changing the delay table breaks this assertion
   assert.equal(st.reopenAttempts, 2)
   assert.equal(dgram.sockets.length, 2, 'the second attempt waits longer than the first')
 
   await new Promise((resolve) => setTimeout(resolve, 900))
   assert.equal(dgram.sockets.length, 3)
 
-  // A packet arriving means the tunnel is healthy, so the next outage starts short again.
   st.socket.emit('message', new Uint8Array([1, 2, 3]), { address: '1.2.3.4', port: 6881, family: 'IPv4' })
   assert.equal(st.reopenAttempts, 0)
   settled(st)

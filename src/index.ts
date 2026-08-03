@@ -1,41 +1,14 @@
-// Public API for the libtorrent WASM module.
-//
-// Usage from a Web Worker (recommended - keeps the main thread responsive):
-//
-//   import { createSession } from 'libtorrent-wasm'
-//   import * as net from '@fkn/lib/net'
-//   import * as dgram from '@fkn/lib/dgram'
-//   import { OPFSStorage } from 'libtorrent-wasm/opfs'
-//
-//   const session = await createSession({ net, dgram, storage: new OPFSStorage() })
-//   const handle = session.addMagnet('magnet:?xt=urn:btih:…', '/downloads')
-//   for await (const alert of session.alerts()) { … }      // pumps the engine
-//   const bytes = await session.read(handle, 0, offset, len) // stream a file
-//
-// The session owns its own tick scheduler - it pumps on a microtask whenever
-// the C side signals via Module.fkn.scheduleTick(), and on a 250 ms timer as
-// a fallback for internal libtorrent timers (DHT bucket refresh, tracker
-// announces, etc).
-
 import type { LtModuleFactory, LtModule, FknHost, StorageBackend } from './types'
 
 export interface SessionOptions {
-  /** @fkn/lib's net module (@fkn/lib/net) */
   net: any
-  /** @fkn/lib's dgram module (@fkn/lib/dgram) */
   dgram: any
-  /** Disk backend - defaults to a no-op (download but discard). Streaming
-   *  `read()` requires a backend that can read back (e.g. OPFSStorage). */
   storage?: StorageBackend
-  /** Override the WASM module factory (testing) */
   moduleFactory?: LtModuleFactory
-  /** Fallback tick interval in ms - used when nothing else pumps */
+  // defaults to 250 ms; the fallback that fires libtorrent's internal timers (DHT bucket refresh, tracker announces) when no socket or disk activity is pumping ticks
   tickIntervalMs?: number
-  /** Per-socket uTP receive buffer capacity in bytes - defaults to 1 MiB */
+  // defaults to 1 MiB (the patched lt::aux::utp_receive_buffer_capacity)
   utpReceiveBufferBytes?: number
-  /** Print the transport and tick traces. Off by default: on an ordinary download they
-   *  run to several hundred console lines a minute, which is useful while working on the
-   *  transport and noise everywhere else. */
   debug?: boolean
 }
 
@@ -51,36 +24,29 @@ export const TORRENT_STATE = {
 
 export interface TorrentStatus {
   state: number
-  progress: number      // 0..1
-  totalDone: number     // bytes we have
-  totalWanted: number   // bytes of wanted pieces
-  downloadRate: number  // payload bytes/s
-  uploadRate: number    // payload bytes/s
+  // units: progress is 0..1, totalDone is bytes we have, totalWanted is bytes of wanted pieces, download/uploadRate are payload bytes/s
+  progress: number
+  totalDone: number
+  totalWanted: number
+  downloadRate: number
+  uploadRate: number
   numPeers: number
   numSeeds: number
   numPiecesTotal: number
   numPiecesHave: number
   hasMetadata: boolean
   paused: boolean
-  /**
-   * Still in libtorrent's own rotation. It stops whatever sits past active_downloads /
-   * active_seeds and starts it again once a slot frees, so a paused torrent that is still
-   * auto-managed and has no error is queued, not broken. The flag survives an error, so
-   * read it together with `errorCode` rather than on its own.
-   */
   autoManaged: boolean
-  /** Position in the download queue, or -1 for a seeding or finished torrent. */
+  // -1 for a seeding or finished torrent
   queuePosition: number
-  /** libtorrent's error_code value for this torrent, 0 when it has no error. */
   errorCode: number
-  /** The matching message, empty when there is no error. */
   error: string
 }
 
 export interface FileEntry {
   path: string
   size: number
-  /** absolute byte offset of this file within the concatenated torrent payload */
+  // absolute byte offset of this file within the concatenated torrent payload, not an offset inside the file
   offset: number
 }
 
@@ -92,12 +58,11 @@ export interface TorrentFiles {
   files: FileEntry[]
 }
 
+// MSB-first packed have-set: piece p is set iff (pieces[p>>3] & (0x80 >> (p&7)))
 export interface PieceBitfield {
-  /** MSB-first packed have-set: piece p is set iff (pieces[p>>3] & (0x80 >> (p&7))) */
   pieces: Uint8Array
   numPieces: number
   pieceLength: number
-  /** total torrent payload size, for byte↔piece mapping */
   length: number
 }
 
@@ -106,10 +71,9 @@ export interface Alert {
   message: string
 }
 
-// Binary record ids the wrapper appends to the alert stream (see wrapper.cpp).
-// Chosen to avoid real libtorrent alert ids and the 0xFFFFFFFx sentinels.
 const utf8 = new TextDecoder()
 
+// Binary record ids the wrapper appends to the alert stream (see wrapper.cpp).
 const REC_TORRENT_READY = 0xf0000001
 const REC_STATE_UPDATE = 0xf0000002
 const REC_READ_PIECE = 0xf0000003
@@ -124,13 +88,10 @@ export class Session {
   private destroyed = false
   private fallbackTimer?: number
 
-  // Latest-per-handle state decoded from the binary alert records.
   private filesByHandle = new Map<number, TorrentFiles>()
   private bitfieldByHandle = new Map<number, { pieces: Uint8Array, numPieces: number }>()
   private statusByHandle = new Map<number, TorrentStatus>()
-  // read() awaits the covering pieces becoming available (have-bit set).
   private pieceWaiters: PieceWaiter[] = []
-  // Latest fast-resume blob per handle + saveResumeData() awaiters.
   private resumeByHandle = new Map<number, Uint8Array>()
   private resumeWaiters: ResumeWaiter[] = []
 
@@ -168,8 +129,6 @@ export class Session {
     }
   }
 
-  // Re-add a torrent from a fast-resume blob (skips recheck + network
-  // re-download - the resume have-bitmask is trusted against the OPFS files).
   addTorrentWithResume(resume: Uint8Array, savePath: string = '/downloads'): number {
     const m = this.mod
     const ptr = m._malloc(resume.length)
@@ -193,18 +152,9 @@ export class Session {
   pauseTorrent(handle: number) { this.mod._lt_torrent_pause(handle) }
   resumeTorrent(handle: number) { this.mod._lt_torrent_resume(handle) }
 
-  /**
-   * Re-verify every piece against the bytes on disk, for when the files and the recorded
-   * have-set have drifted apart. The torrent forgets what it has first, so any saved
-   * resume blob for it is stale from this point and should be discarded. It reports
-   * through the usual status updates, with `state` at checkingResumeData then
-   * checkingFiles and `progress` tracking the check rather than the download. A paused or
-   * errored torrent cannot be scheduled for a check, so this clears both.
-   */
+  // The torrent forgets what it has first, so any saved resume blob for it is stale.
   forceRecheck(handle: number) { this.mod._lt_torrent_force_recheck(handle) }
 
-  // Snapshot fast-resume state. Resolves with the bencoded blob once libtorrent
-  // posts it (async). Rejects after a timeout so callers can't hang forever.
   saveResumeData(handle: number, timeoutMs = 8000): Promise<Uint8Array> {
     this.mod._lt_torrent_save_resume_data(handle)
     return new Promise<Uint8Array>((resolve, reject) => {
@@ -217,15 +167,10 @@ export class Session {
     })
   }
 
-  // ---- streaming-read surface ----------------------------------------------
-
-  /** The torrent's file layout (path/size/absolute offset) + piece geometry.
-   *  null until metadata + storage are ready (the torrent-ready record). */
   files(handle: number): TorrentFiles | null {
     return this.filesByHandle.get(handle) ?? null
   }
 
-  /** The have-set bitfield + geometry, for rendering downloaded ranges. */
   bitfield(handle: number): PieceBitfield | null {
     const bf = this.bitfieldByHandle.get(handle)
     const layout = this.filesByHandle.get(handle)
@@ -233,15 +178,10 @@ export class Session {
     return { pieces: bf.pieces, numPieces: bf.numPieces, pieceLength: layout.pieceLength, length: layout.totalSize }
   }
 
-  /** Latest status (peers/speeds/progress/state). null until first state update. */
   status(handle: number): TorrentStatus | null {
     return this.statusByHandle.get(handle) ?? null
   }
 
-  /** Read a byte range of a file. Prioritizes + deadlines the covering pieces
-   *  (so a seek is served quickly), awaits them landing, then reads the exact
-   *  range from the storage backend (which the disk write path already filled).
-   *  Requires a readable storage backend (e.g. OPFSStorage). */
   async read(handle: number, fileIndex: number, offset: number, len: number): Promise<Uint8Array> {
     const layout = this.filesByHandle.get(handle)
     if (!layout) throw new Error(`read: no layout for handle ${handle} (metadata not ready)`)
@@ -253,19 +193,16 @@ export class Session {
     const p0 = Math.floor(absStart / pieceLength)
     const p1 = Math.floor((absStart + len - 1) / pieceLength)
     if (!this.hasPieces(handle, p0, p1)) {
-      // deadline 0 = most urgent; makes these pieces time-critical so a seek
-      // doesn't wait for sequential download to reach them.
+      // deadline 0 = most urgent
       for (let p = p0; p <= p1; p++) this.mod._lt_torrent_set_piece_deadline(handle, p, 0, 0)
       this.mod._lt_torrent_post_status(handle)
       await this.awaitPieces(handle, p0, p1)
     }
-    // have-bit set ⇒ the piece passed hash AND its disk write completed, so the
-    // bytes are flushed to the backend (no read-before-write race).
+    // have-bit set ⇒ the piece passed hash AND its disk write completed (no read-before-write race)
     const data = await this.storage.read(layout.storageIndex, fileIndex, offset, len)
     return data instanceof Uint8Array ? data : new Uint8Array(data)
   }
 
-  /** Top-priority + deadline the pieces covering a byte range (call on seek). */
   prioritizeRange(handle: number, fileIndex: number, offset: number, len: number) {
     const layout = this.filesByHandle.get(handle)
     const file = layout?.files[fileIndex]
@@ -273,8 +210,8 @@ export class Session {
     const { pieceLength } = layout
     const p0 = Math.floor((file.offset + offset) / pieceLength)
     const p1 = Math.floor((file.offset + offset + len - 1) / pieceLength)
-    const prios = new Uint8Array(p1 + 1).fill(4) // default priority below the range
-    for (let p = p0; p <= p1; p++) prios[p] = 7  // top
+    const prios = new Uint8Array(p1 + 1).fill(4)
+    for (let p = p0; p <= p1; p++) prios[p] = 7
     this.prioritizePieces(handle, prios)
     for (let p = p0; p <= p1; p++) this.mod._lt_torrent_set_piece_deadline(handle, p, (p - p0) * 1000, 0)
   }
@@ -299,7 +236,6 @@ export class Session {
     finally { m._free(ptr) }
   }
 
-  /** Ask the engine to post a fresh status update (→ state_update record). */
   postStatus(handle: number) {
     this.mod._lt_torrent_post_status(handle)
   }
@@ -314,8 +250,6 @@ export class Session {
       m._free(ptr)
     }
   }
-
-  // ---- piece-availability helpers ------------------------------------------
 
   private hasPieces(handle: number, p0: number, p1: number): boolean {
     const bf = this.bitfieldByHandle.get(handle)
@@ -340,12 +274,7 @@ export class Session {
     })
   }
 
-  // ---- alert pump -----------------------------------------------------------
-
-  // Pump the engine and decode all pending records. Binary records (torrent-
-  // ready / state-update / read-piece) update internal caches as a side effect;
-  // remaining (text) alerts are returned. Eager - NOT a generator - so the cache
-  // updates always run even if the caller ignores the returned text alerts.
+  // Eager - NOT a generator - so the cache updates always run even if the caller ignores the returned text alerts.
   popAlerts(): Alert[] {
     const m = this.mod
     m._lt_session_pump_alerts()
@@ -416,8 +345,6 @@ export class Session {
     const queuePosition = view.getInt32(off, true); off += 4
     const errorCode = view.getInt32(off, true); off += 4
     const errorLen = view.getUint32(off, true); off += 4
-    // Decoding only when there is something to decode: this runs for every torrent on
-    // every tick, and the string is empty in all but the failing case.
     const error = errorLen
       ? utf8.decode(new Uint8Array(view.buffer, view.byteOffset + off, errorLen))
       : ''
@@ -438,8 +365,6 @@ export class Session {
     })
   }
 
-  // Async iterator over text alerts - pumps until destroy(). The pump also
-  // refreshes files()/bitfield()/status() and resolves read() waiters.
   async *alerts(): AsyncIterableIterator<Alert> {
     while (!this.destroyed) {
       for (const a of this.popAlerts()) yield a
@@ -465,12 +390,9 @@ export class Session {
 
 export async function createSession(options: SessionOptions): Promise<Session> {
   const factory = options.moduleFactory
-    // libtorrent.js is the Emscripten glue emitted by the build and dropped
-    // next to this bundle by copy-wasm; it doesn't exist at typecheck time.
     // @ts-ignore - generated sibling, resolved at runtime
     ?? (await import('./libtorrent.js')).default as LtModuleFactory
 
-  // Build the FKN host object the JS library reads on init.
   const host: FknHost = {
     net: options.net,
     dgram: options.dgram,
@@ -478,8 +400,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     debug: options.debug ?? false,
   }
   const mod: LtModule = await factory({ fkn: host })
-  // Before the Session constructor, which creates the session and is itself one of the
-  // things that traces.
+  // Before the Session constructor, which creates the session and is itself one of the things that traces.
   mod._lt_set_log(options.debug ? 1 : 0)
   return new Session(mod, options)
 }

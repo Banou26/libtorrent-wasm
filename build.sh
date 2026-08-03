@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# One-shot: bake the docker image, copy dist/* out of the container, drop it.
-# Mirrors libav-wasm/build.sh.
 set -euo pipefail
 mkdir -p dist
 docker build -t libtorrent-wasm .

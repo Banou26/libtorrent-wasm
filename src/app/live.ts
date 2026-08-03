@@ -1,8 +1,3 @@
-// Live integration: real @fkn/lib/net + dgram via @fkn/lib's iframe to
-// http://localhost:1234/api. Bootstraps the WASM session and exposes
-// everything on window for manual probing - no periodic intervals so the
-// page stays responsive for inspection.
-
 import * as net from '@fkn/lib/net'
 import * as dgram from '@fkn/lib/dgram'
 
@@ -26,19 +21,8 @@ window.addEventListener('unhandledrejection', e => log('unhandled: ' + (e.reason
   const inst = await (factory as any)({ fkn })
   ;(window as any).__inst = inst
   inst._lt_session_create()
-  // Give session_impl::init a chance to run - it calls reopen_listen_sockets
-  // which triggers the first socket() syscall, which is when FKN.init() runs
-  // on the JS side. Without this, anything that touches inst.__FKN right after
-  // session_create (like hookUdp below on first __add()) hits undefined.
   for (let i = 0; i < 30; i++) inst._lt_session_tick()
   log('session up', 'ok')
-
-  // No setIntervals. Driving is manual via console:
-  //   __tick(n)   - pump n ticks
-  //   __drain()   - pull alerts, print them
-  //   __add()     - add the magnet from the input
-  //   __status()  - fds + tick stats
-  //   __rx()      - show incoming UDP packets observed by the hook
 
   const rxLog: any[] = []
   ;(window as any).__rxLog = rxLog
@@ -78,9 +62,6 @@ window.addEventListener('unhandledrejection', e => log('unhandled: ' + (e.reason
     return rc
   }
 
-  // Fallback heartbeat - libtorrent's internal timers (tracker retries,
-  // unchoke, etc.) need someone to tick the io_context to fire. 1 Hz is
-  // plenty for sub-minute cadences and won't pin the CPU.
   setInterval(() => (inst as any).__FKN.scheduleTick(), 1000)
   ;(window as any).__status = () => {
     const fkn = (inst as any).__FKN

@@ -1,6 +1,3 @@
-// Type shape of the Emscripten-generated module. We only declare what
-// `js/index.ts` actually uses; Emscripten exports many more symbols.
-
 export interface LtModule {
   HEAPU8: Uint8Array
   HEAP32: Int32Array
@@ -37,7 +34,6 @@ export interface LtModule {
   _lt_torrent_post_status(handle: number): number
   _lt_torrent_infohash(handle: number, out: number): number
 
-  // streaming commands (all async on the libtorrent side → safe)
   _lt_torrent_set_sequential(handle: number, on: number): number
   _lt_torrent_read_piece(handle: number, piece: number): number
   _lt_torrent_set_piece_deadline(handle: number, piece: number, deadlineMs: number, alertWhenAvailable: number): number
@@ -51,23 +47,11 @@ export interface FknHost {
   net: any
   dgram: any
   storage: StorageBackend | null
-  /** Turn on the transport and tick traces. Off by default: they run to hundreds of
-   *  lines a minute on an ordinary download. */
   debug?: boolean
-  /**
-   * Optional. When supplied, the WASM resolver routes DNS lookups through
-   * this function (typically @fkn/lib's dnsLookup, which tunnels via
-   * WebVPN). When omitted, the module falls back to plain fetch against
-   * 1.1.1.1's DoH JSON endpoint.
-   */
   dnsLookup?: (hostname: string, opts?: { family?: 0 | 4 | 6 })
     => Promise<{ address: string; family: 0 | 4 | 6 } | { address: string; family: 0 | 4 | 6 }[] | undefined>
 }
 
-// The disk-IO contract a host implements. Methods may return sync OR a Promise
-// - the disk bridge detects a Promise and only pays the microtask round-trip
-// then (the cached-handle hot path during streaming stays sync). Methods unused
-// by libtorrent in browser-mode are optional.
 export interface StorageBackend {
   onNewStorage(id: number, savePath: string, files: Array<{ path: string; size: number }>): void | Promise<void>
   onRemoveStorage(id: number): void | Promise<void>

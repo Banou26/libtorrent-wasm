@@ -5,19 +5,11 @@ import nodeStdlibBrowser from './vite-plugin-node-stdlib-browser.js'
 export default defineConfig({
   server: {
     port: 4560,
-    // No COOP/COEP - we don't use SharedArrayBuffer, and setting them
-    // blocks the cross-origin iframe to fkn/web at :1234 (the iframe
-    // needs CORP headers we don't control).
+    // No COOP/COEP - setting them blocks the cross-origin iframe to fkn/web at :1234.
   },
-  // The WASM file is built outside of Vite (by emcmake). Tell Vite to copy
-  // it through as a static asset.
   assetsInclude: ['**/*.wasm'],
   optimizeDeps: {
-    // Force pre-bundling for @fkn/lib's net/dgram subpaths and @fkn/lib so the
-    // node-stdlib shims wrap them up front.
     include: ['@fkn/lib/net', '@fkn/lib/dgram', '@fkn/lib'],
-    // Don't try to optimize the wasm-side libtorrent.js (it isn't an npm
-    // dep - it's the Emscripten output we pull in by relative path).
     exclude: ['libtorrent.js'],
   },
   plugins: [

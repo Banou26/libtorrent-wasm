@@ -1,5 +1,3 @@
-// Dump every alert libtorrent emits during a 30s run.
-
 import { chromium } from '/home/banou/dev/fkn/proxy/node_modules/playwright/index.mjs'
 
 const browser = await chromium.launch({

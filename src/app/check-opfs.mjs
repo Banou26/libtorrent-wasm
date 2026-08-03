@@ -1,6 +1,3 @@
-// Boot the page, download for N seconds, then ask the worker to dump
-// what's in OPFS so we can confirm bytes are actually persisted.
-
 import { chromium } from '/home/banou/dev/fkn/proxy/node_modules/playwright/index.mjs'
 
 const browser = await chromium.launch({
@@ -24,7 +21,7 @@ await page.evaluate(() => {
 console.log('downloading for 30s…')
 await new Promise(r => setTimeout(r, 30_000))
 
-// Walk OPFS root from main thread (workers and main share the same OPFS).
+// Workers and main share the same OPFS.
 const tree = await page.evaluate(async () => {
   const root = await navigator.storage.getDirectory()
   const out = []

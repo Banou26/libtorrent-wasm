@@ -33,17 +33,8 @@
     <pre id="alerts"></pre>
 
     <script>
-      // Node-stdlib shims expected by @fkn/lib transitive deps (buffer,
-      // stream, events). vite-plugin-node-stdlib-browser's inject plugin
-      // is a rollup plugin and Vite 8 uses Rolldown - define the globals
-      // up front so the polyfills can attach.
+      // vite-plugin-node-stdlib-browser's inject plugin is a rollup plugin and Vite 8 uses Rolldown, so define the globals up front.
       window.global = window;
-      // Node's nextTick passes through trailing args to the callback:
-      // `process.nextTick(cb, a, b) → cb(a, b)`. readable-stream relies
-      // on this (see `process.nextTick(resume_, stream, state)`). The
-      // previous shim dropped args, so resume_ ran with `state=undefined`
-      // and threw `Cannot read properties of undefined (reading 'reading')`
-      // on every TCP socket.
       window.process = { env: { NODE_DEBUG: '' }, version: '', nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)) };
     </script>
     <script type="module" src="./live.ts"></script>

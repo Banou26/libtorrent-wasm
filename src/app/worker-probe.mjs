@@ -1,5 +1,3 @@
-// Smoke test for index.html (worker + OPFS storage variant).
-
 import { chromium } from '/home/banou/dev/fkn/proxy/node_modules/playwright/index.mjs'
 
 const URL_ = 'http://localhost:4560/'
@@ -34,8 +32,6 @@ try {
   await T('wait-ready', page.waitForFunction(() => document.getElementById('state')?.textContent === 'ready', null, { timeout: 15000 }), 16000)
   log('worker reports ready, adding magnet')
 
-  // BBB + Ubuntu LTS - more peers usually means we don't have to wait
-  // for one stalling tracker. Multiple trackers improves resilience.
   const magnet = process.argv[2] || 'magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A6969&tr=udp%3A%2F%2Fexodus.desync.com%3A6969'
   await page.evaluate((m) => {
     const inp = document.getElementById('magnet')
