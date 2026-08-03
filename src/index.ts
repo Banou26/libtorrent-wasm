@@ -1,14 +1,24 @@
 import type { LtModuleFactory, LtModule, FknHost, StorageBackend } from './types'
 
 export interface SessionOptions {
+  /** @fkn/lib's net module (@fkn/lib/net) */
   net: any
+  /** @fkn/lib's dgram module (@fkn/lib/dgram) */
   dgram: any
+  /** Disk backend - defaults to a no-op (download but discard). Streaming
+   *  `read()` requires a backend that can read back (e.g. OPFSStorage). */
   storage?: StorageBackend
+  /** Override the WASM module factory (testing) */
   moduleFactory?: LtModuleFactory
   // defaults to 250 ms; the fallback that fires libtorrent's internal timers (DHT bucket refresh, tracker announces) when no socket or disk activity is pumping ticks
+  /** Fallback tick interval in ms - used when nothing else pumps */
   tickIntervalMs?: number
   // defaults to 1 MiB (the patched lt::aux::utp_receive_buffer_capacity)
+  /** Per-socket uTP receive buffer capacity in bytes - defaults to 1 MiB */
   utpReceiveBufferBytes?: number
+  /** Print the transport and tick traces. Off by default: on an ordinary download they
+   *  run to several hundred console lines a minute, which is useful while working on the
+   *  transport and noise everywhere else. */
   debug?: boolean
 }
 
@@ -36,10 +46,19 @@ export interface TorrentStatus {
   numPiecesHave: number
   hasMetadata: boolean
   paused: boolean
+  /**
+   * Still in libtorrent's own rotation. It stops whatever sits past active_downloads /
+   * active_seeds and starts it again once a slot frees, so a paused torrent that is still
+   * auto-managed and has no error is queued, not broken. The flag survives an error, so
+   * read it together with `errorCode` rather than on its own.
+   */
   autoManaged: boolean
   // -1 for a seeding or finished torrent
+  /** Position in the download queue, or -1 for a seeding or finished torrent. */
   queuePosition: number
+  /** libtorrent's error_code value for this torrent, 0 when it has no error. */
   errorCode: number
+  /** The matching message, empty when there is no error. */
   error: string
 }
 
@@ -47,6 +66,7 @@ export interface FileEntry {
   path: string
   size: number
   // absolute byte offset of this file within the concatenated torrent payload, not an offset inside the file
+  /** absolute byte offset of this file within the concatenated torrent payload */
   offset: number
 }
 
@@ -60,9 +80,11 @@ export interface TorrentFiles {
 
 // MSB-first packed have-set: piece p is set iff (pieces[p>>3] & (0x80 >> (p&7)))
 export interface PieceBitfield {
+  /** MSB-first packed have-set: piece p is set iff (pieces[p>>3] & (0x80 >> (p&7))) */
   pieces: Uint8Array
   numPieces: number
   pieceLength: number
+  /** total torrent payload size, for byte↔piece mapping */
   length: number
 }
 
@@ -153,6 +175,14 @@ export class Session {
   resumeTorrent(handle: number) { this.mod._lt_torrent_resume(handle) }
 
   // The torrent forgets what it has first, so any saved resume blob for it is stale.
+  /**
+   * Re-verify every piece against the bytes on disk, for when the files and the recorded
+   * have-set have drifted apart. The torrent forgets what it has first, so any saved
+   * resume blob for it is stale from this point and should be discarded. It reports
+   * through the usual status updates, with `state` at checkingResumeData then
+   * checkingFiles and `progress` tracking the check rather than the download. A paused or
+   * errored torrent cannot be scheduled for a check, so this clears both.
+   */
   forceRecheck(handle: number) { this.mod._lt_torrent_force_recheck(handle) }
 
   saveResumeData(handle: number, timeoutMs = 8000): Promise<Uint8Array> {
@@ -167,10 +197,13 @@ export class Session {
     })
   }
 
+  /** The torrent's file layout (path/size/absolute offset) + piece geometry.
+   *  null until metadata + storage are ready (the torrent-ready record). */
   files(handle: number): TorrentFiles | null {
     return this.filesByHandle.get(handle) ?? null
   }
 
+  /** The have-set bitfield + geometry, for rendering downloaded ranges. */
   bitfield(handle: number): PieceBitfield | null {
     const bf = this.bitfieldByHandle.get(handle)
     const layout = this.filesByHandle.get(handle)
@@ -178,10 +211,15 @@ export class Session {
     return { pieces: bf.pieces, numPieces: bf.numPieces, pieceLength: layout.pieceLength, length: layout.totalSize }
   }
 
+  /** Latest status (peers/speeds/progress/state). null until first state update. */
   status(handle: number): TorrentStatus | null {
     return this.statusByHandle.get(handle) ?? null
   }
 
+  /** Read a byte range of a file. Prioritizes + deadlines the covering pieces
+   *  (so a seek is served quickly), awaits them landing, then reads the exact
+   *  range from the storage backend (which the disk write path already filled).
+   *  Requires a readable storage backend (e.g. OPFSStorage). */
   async read(handle: number, fileIndex: number, offset: number, len: number): Promise<Uint8Array> {
     const layout = this.filesByHandle.get(handle)
     if (!layout) throw new Error(`read: no layout for handle ${handle} (metadata not ready)`)
@@ -203,6 +241,7 @@ export class Session {
     return data instanceof Uint8Array ? data : new Uint8Array(data)
   }
 
+  /** Top-priority + deadline the pieces covering a byte range (call on seek). */
   prioritizeRange(handle: number, fileIndex: number, offset: number, len: number) {
     const layout = this.filesByHandle.get(handle)
     const file = layout?.files[fileIndex]
@@ -236,6 +275,7 @@ export class Session {
     finally { m._free(ptr) }
   }
 
+  /** Ask the engine to post a fresh status update (→ state_update record). */
   postStatus(handle: number) {
     this.mod._lt_torrent_post_status(handle)
   }

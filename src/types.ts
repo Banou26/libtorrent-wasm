@@ -47,7 +47,15 @@ export interface FknHost {
   net: any
   dgram: any
   storage: StorageBackend | null
+  /** Turn on the transport and tick traces. Off by default: they run to hundreds of
+   *  lines a minute on an ordinary download. */
   debug?: boolean
+  /**
+   * Optional. When supplied, the WASM resolver routes DNS lookups through
+   * this function (typically @fkn/lib's dnsLookup, which tunnels via
+   * WebVPN). When omitted, the module falls back to plain fetch against
+   * 1.1.1.1's DoH JSON endpoint.
+   */
   dnsLookup?: (hostname: string, opts?: { family?: 0 | 4 | 6 })
     => Promise<{ address: string; family: 0 | 4 | 6 } | { address: string; family: 0 | 4 | 6 }[] | undefined>
 }
