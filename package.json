@@ -30,6 +30,7 @@
     "vite-build": "vp build",
     "vite-build-dev": "vp build --watch",
     "build": "npm run make-docker && npm run vite-build && npm run types && npm run copy-wasm",
+    "prepublishOnly": "npm run vite-build && npm run types && npm run copy-wasm",
     "types": "tsc",
     "copy-wasm": "copyfiles -u 1 dist/libtorrent.js dist/libtorrent.wasm build",
     "test": "node --test \"tests/**/*.test.mjs\"",
