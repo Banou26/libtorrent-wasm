@@ -470,6 +470,22 @@ export class Session {
   }
 
   /**
+   * Cancel every outstanding request for a piece's blocks, so any peer may pick them up again.
+   *
+   * For the case where one peer has claimed all of a piece's blocks and then stopped delivering
+   * them. Nothing else recovers that: the request-cancel sweep skips pieces that have a deadline,
+   * which is exactly the pieces a player is blocked on, and libtorrent's duplicate-request rescue
+   * does not engage until a deadlined piece has already completed once. Without this the only exit
+   * is a peer timeout, which is tens of seconds.
+   *
+   * Use it on a read that has ALREADY been waiting. Called early it throws away partial blocks from
+   * a peer that was merely slow, which costs more than it saves.
+   */
+  cancelPieceRequests(handle: number, piece: number): boolean {
+    return this.mod._lt_torrent_cancel_piece_requests(handle, piece) === 0
+  }
+
+  /**
    * Positional priority map, one byte per piece from piece 0 (0=skip, 1=low, 4=default, 7=top).
    * A short array is padded out to the torrent's piece count from what this Session last wrote
    * (or the default 4), and a long one is truncated, so libtorrent always gets exactly one byte per

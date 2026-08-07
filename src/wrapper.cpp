@@ -37,7 +37,11 @@ extern "C" int __syscall_setsockopt(int /*fd*/, int /*level*/, int /*optname*/,
 #include "libtorrent/write_resume_data.hpp"
 #include "libtorrent/read_resume_data.hpp"
 #include "libtorrent/session_handle.hpp"
+#include "libtorrent/torrent.hpp"
+#include "libtorrent/piece_block.hpp"
+#include "libtorrent/piece_picker.hpp"
 #include "libtorrent/aux_/utp_stream.hpp"
+#include <boost/asio/post.hpp>
 
 #include "disk_io.hpp"
 
@@ -790,6 +794,38 @@ LT_API int lt_torrent_prioritize_files(std::uint32_t id,
   std::vector<lt::download_priority_t> v(count);
   for (std::uint32_t i = 0; i < count; ++i) v[i] = clamp_prio(prios[i]);
   h->prioritize_files(v);
+  return 0;
+}
+
+// Take a piece back from whatever peers are sitting on it, by cancelling every outstanding request
+// for its blocks so any peer may pick them again.
+//
+// This exists because nothing else can do it. cancel_non_critical() cancels stale requests but
+// deliberately SKIPS pieces in m_time_critical_pieces, so a piece that has been deadlined (which is
+// how a streaming client says "I need this now") is precisely the piece it will not reclaim. The
+// duplicate-request path that would otherwise rescue it is gated behind m_average_piece_time > 0,
+// which stays 0 until a deadlined piece has already completed, so it is inert during startup. That
+// leaves only the snub and request timeouts, i.e. tens of seconds, for a piece playback is blocked
+// on. Callers should reach for this only for a read that has already waited.
+//
+// Deferred onto the io_context rather than run inline: every other entry point here goes through
+// torrent_handle's async_call, and native_handle() would bypass that. This keeps the same
+// discipline, and mirrors how libtorrent defers its own cancel_non_critical.
+LT_API int lt_torrent_cancel_piece_requests(std::uint32_t id, std::int32_t piece) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  auto const* geo = geometry_for(id);
+  if (!geo || piece < 0 || piece >= geo->num_pieces) return -1;
+  auto t = h->native_handle();
+  if (!t) return -1;
+  boost::asio::post(*g_session->ioc, [t, piece] {
+    // a torrent that finished has no picker, and cancel_request would dereference it
+    if (!t->has_picker()) return;
+    lt::piece_index_t const idx{piece};
+    int const blocks = t->picker().blocks_in_piece(idx);
+    for (int b = 0; b < blocks; ++b) t->cancel_block(lt::piece_block{idx, b});
+  });
   return 0;
 }
 

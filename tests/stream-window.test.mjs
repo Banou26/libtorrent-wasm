@@ -69,6 +69,7 @@ const makeModule = () => {
     },
     _lt_torrent_prioritize_files: (h, ptr, n) => log('prioritize_files', h, HEAPU8.slice(ptr, ptr + n)),
     _lt_torrent_set_file_priority: (h, f, prio) => log('set_file_priority', h, f, prio),
+    _lt_torrent_cancel_piece_requests: (h, p) => log('cancel_piece_requests', h, p),
     _lt_session_remove_torrent_ex: (h) => log('remove', h),
 
     // push a record into the alert buffer the next popAlerts() will drain
@@ -429,6 +430,14 @@ test('read with deadlineMs null touches neither priorities nor deadlines', async
     await assert.rejects(pending, /did not arrive/)
     assert.equal(names(mod).includes('set_deadline'), false)
     assert.equal(names(mod).includes('reset_deadline'), false)
+  } finally { session.destroy() }
+})
+
+test('cancelPieceRequests reaches the engine and reports whether it landed', async () => {
+  const { mod, session } = await setup()
+  try {
+    assert.equal(session.cancelPieceRequests(1, 7), true)
+    assert.deepEqual(mod.calls.at(-1), { name: 'cancel_piece_requests', args: [1, 7] })
   } finally { session.destroy() }
 })
 

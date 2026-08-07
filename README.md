@@ -85,6 +85,27 @@ primitives directly:
   arriving. An expired deadline from an abandoned seek outranks every range
   requested after it, so retire deadlines you no longer want.
 
+### When a read waits on a piece nobody will deliver
+
+One peer can claim every block of a piece and then stop sending them. Nothing in
+libtorrent recovers that on its own:
+
+- The picker walks straight past it. Its "is this piece available" test checks
+  only have/filtered, with no "already being downloaded" case, so the in-order
+  walk keeps downloading ahead at full speed while the piece sits there. Bytes
+  keep climbing and playback does not start.
+- No other peer may duplicate the blocks while its own request queue is
+  non-empty, which in a live swarm is always.
+- The sweep that cancels stale requests deliberately skips pieces that have a
+  deadline, so marking a piece urgent is what protects the stall.
+- The duplicate-request rescue only engages once a deadlined piece has already
+  completed, so it is inert exactly when it is needed, at startup.
+
+`cancelPieceRequests(handle, piece)` is the way out: it drops every outstanding
+request for that piece so any peer can pick it up again. Call it for a read that
+has already been waiting several seconds, not on the first attempt, since it
+discards partial blocks from peers that were merely slow.
+
 ### API
 
 | Call | Purpose |
@@ -95,6 +116,7 @@ primitives directly:
 | `setSequential(handle, on)` | The `sequential_download` flag on its own. |
 | `setPieceDeadline(handle, piece, ms, alertWhenAvailable?)` | One deadline. `ms` is relative to now. |
 | `resetPieceDeadline(handle, piece)` | Retire one deadline, leaving the rest. |
+| `cancelPieceRequests(handle, piece)` | Take a piece back from peers sitting on it. See below. |
 | `clearPieceDeadlines(handle)` | Retire all of them. Demotes to priority 1. |
 | `prioritizePieces(handle, prios)` | Positional map, one byte per piece from 0. |
 | `prioritizePieceList(handle, entries)` | Sparse update; other pieces keep what they have. |
