@@ -38,7 +38,11 @@ export interface LtModule {
   _lt_torrent_read_piece(handle: number, piece: number): number
   _lt_torrent_set_piece_deadline(handle: number, piece: number, deadlineMs: number, alertWhenAvailable: number): number
   _lt_torrent_clear_piece_deadlines(handle: number): number
+  _lt_torrent_reset_piece_deadline(handle: number, piece: number): number
   _lt_torrent_prioritize_pieces(handle: number, priosPtr: number, count: number): number
+  _lt_torrent_prioritize_piece_list(handle: number, piecesPtr: number, priosPtr: number, count: number): number
+  _lt_torrent_prioritize_files(handle: number, priosPtr: number, count: number): number
+  _lt_torrent_set_file_priority(handle: number, fileIndex: number, prio: number): number
 }
 
 export type LtModuleFactory = (init?: Partial<{ fkn: FknHost; wasmBinary: ArrayBuffer }>) => Promise<LtModule>

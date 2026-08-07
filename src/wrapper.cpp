@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -55,12 +56,21 @@ LT_API void lt_set_log(int on) { g_log_enabled = on != 0; }
 
 namespace {
 
+struct torrent_geometry {
+  std::int32_t num_pieces = 0;
+  std::int32_t num_files = 0;
+};
+
 struct session_state {
   std::unique_ptr<lt::io_context> ioc;
   std::unique_ptr<lt::session> ses;
 
   std::unordered_map<std::uint32_t, lt::torrent_handle> handles;
   std::unordered_map<std::string, std::uint32_t> hash_ids;
+  // piece and file counts, cached when the torrent-ready record is built. Every synchronous
+  // libtorrent getter (torrent_file(), get_piece_priorities()) sync_calls an io_context that only
+  // runs when JS ticks, so it would deadlock here: a bounds check has to read this, never the handle.
+  std::unordered_map<std::uint32_t, torrent_geometry> geometry;
   std::uint32_t next_handle_id = 1;
 };
 
@@ -104,6 +114,12 @@ lt::torrent_handle* lookup_handle(std::uint32_t id) {
   return it == g_session->handles.end() ? nullptr : &it->second;
 }
 
+// null until the torrent-ready record has been built for this handle
+torrent_geometry const* geometry_for(std::uint32_t id) {
+  auto it = g_session->geometry.find(id);
+  return it == g_session->geometry.end() ? nullptr : &it->second;
+}
+
 // record ids avoid real libtorrent alert ids (5/41/45/67/68) and the 0xFFFFFFFx diagnostic sentinels; all ints little-endian
 constexpr std::uint32_t REC_TORRENT_READY = 0xF0000001u;
 constexpr std::uint32_t REC_STATE_UPDATE  = 0xF0000002u;
@@ -133,6 +149,7 @@ bool emit_torrent_ready(std::uint32_t storage_index) {
   if (hid == 0) return false;
   auto const* fs = si.fs;
   int const nf = fs->num_files();
+  g_session->geometry[hid] = torrent_geometry{fs->num_pieces(), nf};
   std::vector<std::uint8_t> p;
   auto u32 = [&](std::uint32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
   auto i64 = [&](std::int64_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 8); };
@@ -176,6 +193,8 @@ void emit_state_update(lt::state_update_alert const* sua) {
     u32((st.flags & lt::torrent_flags::paused) ? 1u : 0u);
     // auto_managed survives an error, so errc set is a failure while auto-managed without an error is the queue
     u32((st.flags & lt::torrent_flags::auto_managed) ? 1u : 0u);
+    // so a streaming caller can confirm set_sequential landed rather than assuming it
+    u32((st.flags & lt::torrent_flags::sequential_download) ? 1u : 0u);
     i32(static_cast<std::int32_t>(static_cast<int>(st.queue_position)));
     i32(st.errc ? st.errc.value() : 0);
     std::string const err = st.errc ? st.errc.message() : std::string();
@@ -527,6 +546,7 @@ LT_API int lt_session_remove_torrent(std::uint32_t id) {
   if (!h) return -1;
   g_session->ses->remove_torrent(*h);
   g_session->handles.erase(id);
+  g_session->geometry.erase(id);
   return 0;
 }
 
@@ -538,6 +558,7 @@ LT_API int lt_session_remove_torrent_ex(std::uint32_t id, int delete_files) {
   if (delete_files) flags = lt::session_handle::delete_files;
   g_session->ses->remove_torrent(*h, flags);
   g_session->handles.erase(id);
+  g_session->geometry.erase(id);
   return 0;
 }
 
@@ -672,6 +693,9 @@ LT_API int lt_torrent_set_piece_deadline(std::uint32_t id, std::int32_t piece,
   return 0;
 }
 
+// Drops EVERY deadline on the torrent and demotes each cleared piece to priority 1, not back to the
+// default 4. So a caller that clears and then re-prioritizes must do it in that order; the reverse
+// silently undoes the priorities it just wrote.
 LT_API int lt_torrent_clear_piece_deadlines(std::uint32_t id) {
   if (!g_session) return -1;
   auto* h = lookup_handle(id);
@@ -680,14 +704,91 @@ LT_API int lt_torrent_clear_piece_deadlines(std::uint32_t id) {
   return 0;
 }
 
-// prios encoding: 0=skip, 1=low, 4=default, 7=top; pieces beyond `count` keep their priority
+// Retires one piece from the time-critical set, leaving the others alone. Without this the only
+// way to drop an abandoned deadline is clear_piece_deadlines(), which takes the whole set with it.
+// Like that call it also drops the piece to priority 1, so the caller has to put back whatever
+// priority it wanted the piece to keep.
+LT_API int lt_torrent_reset_piece_deadline(std::uint32_t id, std::int32_t piece) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  auto const* geo = geometry_for(id);
+  if (!geo || piece < 0 || piece >= geo->num_pieces) return -1;
+  h->reset_piece_deadline(lt::piece_index_t{piece});
+  return 0;
+}
+
+static inline lt::download_priority_t clamp_prio(std::uint8_t v) {
+  // the field is 3 bits wide, so 8 would store as 0 and silently mark the piece as never-download
+  return lt::download_priority_t{static_cast<std::uint8_t>(v > 7 ? 7 : v)};
+}
+
+// prios encoding: 0=skip, 1=low, 4=default, 7=top. Positional from piece 0; pieces beyond `count`
+// keep their priority. `count` is clamped to the torrent's piece count because libtorrent applies
+// this vector with no bound of its own and its asserts are compiled out here, so an over-long array
+// would write past piece_picker::m_piece_map. Returns -1 before the torrent-ready record lands,
+// since the piece count needed for that clamp is not known yet.
 LT_API int lt_torrent_prioritize_pieces(std::uint32_t id,
                                         std::uint8_t const* prios, std::uint32_t count) {
   if (!g_session || !prios) return -1;
   auto* h = lookup_handle(id);
   if (!h || !h->is_valid()) return -1;
+  auto const* geo = geometry_for(id);
+  if (!geo) return -1;
+  if (count > static_cast<std::uint32_t>(geo->num_pieces))
+    count = static_cast<std::uint32_t>(geo->num_pieces);
   std::vector<lt::download_priority_t> v(count);
-  for (std::uint32_t i = 0; i < count; ++i) v[i] = lt::download_priority_t{prios[i]};
+  for (std::uint32_t i = 0; i < count; ++i) v[i] = clamp_prio(prios[i]);
   h->prioritize_pieces(v);
+  return 0;
+}
+
+// Sparse form: only the listed pieces change, every other piece keeps its priority. It avoids
+// rewriting the whole map, so this is the call for a window that moves with the playhead.
+// Requires metadata, and filters the indices itself: unlike the positional overload this path has
+// no metadata guard inside libtorrent, and it reaches need_picker(), which builds a picker out of a
+// zero piece length and then divides by it. Returns -1 before the torrent-ready record lands.
+LT_API int lt_torrent_prioritize_piece_list(std::uint32_t id, std::int32_t const* pieces,
+                                            std::uint8_t const* prios, std::uint32_t count) {
+  if (!g_session || !pieces || !prios) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  auto const* geo = geometry_for(id);
+  if (!geo) return -1;
+  std::vector<std::pair<lt::piece_index_t, lt::download_priority_t>> v;
+  v.reserve(count);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    if (pieces[i] < 0 || pieces[i] >= geo->num_pieces) continue;
+    v.emplace_back(lt::piece_index_t{pieces[i]}, clamp_prio(prios[i]));
+  }
+  if (v.empty()) return 0;
+  h->prioritize_pieces(v);
+  return 0;
+}
+
+// Same encoding as the piece priorities, one byte per file. libtorrent resizes this vector to the
+// file count itself, padding with the default 4, so a short array silently resets the files it
+// omits: always send one byte per file. Setting any file priority also rewrites every piece
+// priority to match, so piece-level priorities have to be re-applied after this.
+LT_API int lt_torrent_prioritize_files(std::uint32_t id,
+                                       std::uint8_t const* prios, std::uint32_t count) {
+  if (!g_session || !prios) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  std::vector<lt::download_priority_t> v(count);
+  for (std::uint32_t i = 0; i < count; ++i) v[i] = clamp_prio(prios[i]);
+  h->prioritize_files(v);
+  return 0;
+}
+
+LT_API int lt_torrent_set_file_priority(std::uint32_t id, std::int32_t file, std::uint8_t prio) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  // libtorrent deliberately supports selecting a file before metadata arrives, so only bound the
+  // index once the file count is actually known
+  auto const* geo = geometry_for(id);
+  if (file < 0 || (geo && file >= geo->num_files)) return -1;
+  h->file_priority(lt::file_index_t{file}, clamp_prio(prio));
   return 0;
 }
