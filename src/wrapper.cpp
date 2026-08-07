@@ -262,7 +262,19 @@ LT_API int lt_session_create() {
   sp.set_int(lt::settings_pack::max_out_request_queue, 5000);
   sp.set_int(lt::settings_pack::connections_limit, 500);
   sp.set_int(lt::settings_pack::peer_timeout, 240);
-  sp.set_int(lt::settings_pack::request_timeout, 120);
+  // 30, not the old 120: a peer that stops delivering blocks it already holds is the thing that
+  // strands the first pieces of a file. Measured on a well-seeded 1080p MKV, pieces 0-2 took over
+  // 72 seconds to arrive while the torrent ran at 10 MB/s, so playback never started at all.
+  // 30 also matches the floor patch 0004 applies to peers that have samples.
+  sp.set_int(lt::settings_pack::request_timeout, 30);
+  // Same failure, the other half. m_last_piece is refreshed by a fragment of ANY piece, so a peer
+  // that serves other pieces while sitting on this one never trips the snub at the default 20.
+  sp.set_int(lt::settings_pack::piece_timeout, 10);
+  // Finish pieces already begun before opening new ones. Off by default, and libtorrent's own
+  // high-performance preset turns it on. It adds prioritize_partials to the picker options even in
+  // sequential mode, which runs the partial loop ahead of both sequential loops, so a half-finished
+  // head piece stops losing to a fresh one further down the file.
+  sp.set_bool(lt::settings_pack::prioritize_partial_pieces, true);
   sp.set_int(lt::settings_pack::unchoke_slots_limit, 32);
   // do not switch to peer_proportional: it rate-limits the TCP class (webseeds included), prefer_tcp leaves it uncapped
   sp.set_int(lt::settings_pack::mixed_mode_algorithm, lt::settings_pack::prefer_tcp);
