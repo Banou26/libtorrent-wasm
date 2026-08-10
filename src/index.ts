@@ -20,6 +20,16 @@ export interface SessionOptions {
    *  run to several hundred console lines a minute, which is useful while working on the
    *  transport and noise everywhere else. */
   debug?: boolean
+  /**
+   * Join the DHT. Defaults to true, which is what a real client wants: it is how a magnet
+   * with no live tracker finds anyone at all.
+   *
+   * Pass false for a closed swarm whose peers are all known up front (a local test rig).
+   * Leaving it on there is not merely untidy: the session announces the infohash publicly
+   * and gets real peers back for it, so the measurement includes strangers who do not have
+   * the data, along with their latency and their variance.
+   */
+  enableDht?: boolean
 }
 
 // torrent_status state_t (TORRENT_ABI_VERSION 3). Only these values occur.
@@ -193,6 +203,8 @@ export class Session {
     this.mod = mod
     this.storage = options.storage ?? null
     if (options.utpReceiveBufferBytes) mod._lt_set_utp_receive_buffer(options.utpReceiveBufferBytes)
+    // before _lt_session_create, which is where the settings pack is built
+    if (options.enableDht === false) mod._lt_set_dht(0)
     if (mod._lt_session_create() !== 0) {
       throw new Error('lt_session_create returned non-zero')
     }

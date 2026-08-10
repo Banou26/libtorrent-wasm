@@ -249,6 +249,21 @@ LT_API void lt_set_utp_receive_buffer(std::int32_t bytes) {
   if (bytes > 0) lt::aux::utp_receive_buffer_capacity = bytes;
 }
 
+// DHT is on by default and that is what production wants: it is how a magnet with
+// no live tracker finds anyone at all.
+//
+// A local test swarm wants it off, and not merely to be tidy. With it on the
+// engine announces the fixture's infohash to the public DHT and gets real peers
+// back for it, so a "local" measurement includes strangers who do not have the
+// data, real network latency, and an unbounded amount of run-to-run variance.
+// Measured on a two-seeder loopback swarm: one run reached metadata in 906 ms,
+// the next never reached it at all.
+static bool g_dht_enabled = true;
+// call before lt_session_create(); read once when the settings pack is built
+LT_API void lt_set_dht(int on) {
+  g_dht_enabled = on != 0;
+}
+
 LT_API int lt_session_create() {
   if (g_session) return -1;
 
@@ -295,10 +310,13 @@ LT_API int lt_session_create() {
   sp.set_int(lt::settings_pack::utp_syn_resends, 4);
   sp.set_int(lt::settings_pack::utp_gain_factor, 8000);
   // safe under -sUSE_PTHREADS=0: the bootstrap hostnames resolve through the JS DoH resolver (patch 0001: js_resolver_async -> lt_dns_complete), so libtorrent spawns no resolver thread
-  sp.set_bool(lt::settings_pack::enable_dht, true);
+  sp.set_bool(lt::settings_pack::enable_dht, g_dht_enabled);
+  // left empty when DHT is off so nothing resolves the bootstrap hostnames either
   sp.set_str(lt::settings_pack::dht_bootstrap_nodes,
-      "dht.libtorrent.org:25401,router.bittorrent.com:6881,"
-      "router.utorrent.com:6881,dht.transmissionbt.com:6881");
+      g_dht_enabled
+        ? "dht.libtorrent.org:25401,router.bittorrent.com:6881,"
+          "router.utorrent.com:6881,dht.transmissionbt.com:6881"
+        : "");
   // pools MUST stay at 0 so nothing tries pthread_create
   sp.set_int(lt::settings_pack::aio_threads, 0);
   sp.set_int(lt::settings_pack::hashing_threads, 0);
