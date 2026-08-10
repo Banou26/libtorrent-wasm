@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Banou <me@banou.dev>
+Date: Tue, 11 Aug 2026 06:00:00 +0900
+Subject: [PATCH] fix: rescue a late time critical piece before the first one completes
+
+---
+diff --git a/src/torrent.cpp b/src/torrent.cpp
+index 802deee5e..4f560cc7c 100644
+--- a/src/torrent.cpp
++++ b/src/torrent.cpp
+@@ -11114,6 +11114,34 @@ namespace {
+ 
+ 		time_point const now = clock_type::now();
+ 
++		// m_average_piece_time is only ever assigned when a time critical piece
++		// COMPLETES, so it is 0 for the whole start of a stream, and both uses of
++		// it below degrade to their most conservative form at exactly the moment
++		// streaming can least afford it:
++		//
++		//  - the deadline horizon collapses to now + 1000ms, so only the first
++		//    piece or two is considered per pass.
++		//  - timed_out stays 0, and pick_time_critical_block breaks out of busy
++		//    mode when timed_out is 0. That disables the redundant request, which
++		//    is the ONLY mechanism that can recover a piece whose every block is
++		//    already outstanding to a peer that is not delivering.
++		//
++		// So the rescue for a late time critical piece cannot fire until a time
++		// critical piece has already succeeded. For the first pieces of a file
++		// nothing else covers it either: the in-order walk in pick_pieces skips
++		// top priority pieces, and a deadline sets exactly that priority.
++		//
++		// Treat "no measurement yet" as a conservative estimate rather than as
++		// zero. The real average replaces it as soon as one piece completes.
++		//
++		// 2 seconds is deliberately longer than a healthy piece takes, so on a
++		// swarm that is working this changes nothing: timed_out only becomes
++		// non-zero once every block of a piece has been outstanding that long.
++		constexpr int default_average_piece_time = 2000;
++		int const avg_piece_time = m_average_piece_time > 0
++			? m_average_piece_time
++			: default_average_piece_time;
++
+ 		// now, iterate over all time critical pieces, in order of importance, and
+ 		// request them from the peers, in order of responsiveness. i.e. request
+ 		// the most time critical pieces from the fastest peers.
+@@ -11136,7 +11164,7 @@ namespace {
+ 			// function once per second, so if we need to request it 500 ms from
+ 			// now, we should request it right away
+ 			if (!first_piece && i.deadline > now
+-				+ milliseconds(m_average_piece_time + m_piece_time_deviation * 4 + 1000))
++				+ milliseconds(avg_piece_time + m_piece_time_deviation * 4 + 1000))
+ 			{
+ 				// don't request pieces whose deadline is too far in the future
+ 				// this is one of the termination conditions. We don't want to
+@@ -11172,9 +11200,8 @@ namespace {
+ 				// if it's been more than half of the typical download time
+ 				// of a piece since we requested the last block, allow
+ 				// one more request per block
+-				if (m_average_piece_time > 0)
+-					timed_out = int(total_milliseconds(now - i.last_requested)
+-						/ std::max(int(m_average_piece_time + m_piece_time_deviation / 2), 1));
++				timed_out = int(total_milliseconds(now - i.last_requested)
++					/ std::max(int(avg_piece_time + m_piece_time_deviation / 2), 1));
+ 
+ #if TORRENT_DEBUG_STREAMING > 0
+ 				i.timed_out = timed_out;
