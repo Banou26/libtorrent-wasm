@@ -38,6 +38,9 @@ extern "C" int __syscall_setsockopt(int /*fd*/, int /*level*/, int /*optname*/,
 #include "libtorrent/read_resume_data.hpp"
 #include "libtorrent/session_handle.hpp"
 #include "libtorrent/torrent.hpp"
+// torrent.hpp only forward-declares peer_connection, and lt_torrent_cancel_piece_requests reaches
+// into each peer's download and request queues, so the definition has to come in explicitly
+#include "libtorrent/peer_connection.hpp"
 #include "libtorrent/piece_block.hpp"
 #include "libtorrent/piece_picker.hpp"
 #include "libtorrent/aux_/utp_stream.hpp"
@@ -823,8 +826,35 @@ LT_API int lt_torrent_cancel_piece_requests(std::uint32_t id, std::int32_t piece
     // a torrent that finished has no picker, and cancel_request would dereference it
     if (!t->has_picker()) return;
     lt::piece_index_t const idx{piece};
-    int const blocks = t->picker().blocks_in_piece(idx);
-    for (int b = 0; b < blocks; ++b) t->cancel_block(lt::piece_block{idx, b});
+    // NOT torrent::cancel_block(): it calls cancel_request(block) with force defaulted to false,
+    // and for a block already ON THE WIRE that only sets not_wanted and writes a wire CANCEL, with
+    // picker().abort_download() sitting behind `if (force)`. The picker therefore still counts every
+    // block as requested, the piece stays piece_full, and piece_full reports priority -1, which
+    // removes it from m_pieces entirely and makes add_blocks refuse it. So the piece stays invisible
+    // to every picking path and the cancel achieves nothing at all. Measured 2026-08-11: 28 rounds
+    // of it over 168 s never freed the piece a read was parked on.
+    //
+    // Reaching the peers directly and forcing the release is what cancel_non_critical() does, and
+    // once the blocks are genuinely released abort_download re-adds the piece to m_pieces at top
+    // priority, where the next request_a_block hands it out.
+    for (auto* p : *t) {
+      // copied, because cancel_request erases from the queue we would be iterating
+      auto const dq = p->download_queue();
+      for (auto const& k : dq) {
+        if (k.block.piece_index != idx) continue;
+        // Same filter cancel_non_critical uses, and it is not optional here: a caller retries this
+        // every few seconds, and aborting an already-released block a second time decrements
+        // num_peers for a peer the picker no longer associates with it, freeing the block out from
+        // under whoever holds it now.
+        if (k.not_wanted || k.timed_out) continue;
+        p->cancel_request(k.block, true);
+      }
+      auto const rq = p->request_queue();
+      for (auto const& k : rq) {
+        if (k.block.piece_index != idx) continue;
+        p->cancel_request(k.block, true);
+      }
+    }
   });
   return 0;
 }
