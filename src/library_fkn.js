@@ -55,6 +55,31 @@ addToLibrary({
       FKN._mc.port1.onmessage = FKN._doTick
     },
 
+    /**
+     * Release everything that outlives the session, called from Session.destroy().
+     *
+     * The tick pump's MessageChannel is the one that matters: port1 carries a live onmessage
+     * handler and nothing ever closed it, so it survived _lt_session_destroy() along with any fd
+     * the session did not close on its way out. In a browser that is a slow leak per engine
+     * handover; under node it holds the event loop open for good, which is how it was found (a
+     * passing test left `node --test` unable to finish and every other file reported interrupted).
+     *
+     * Safe to call twice, and safe to call before init: every branch is guarded.
+     */
+    teardown() {
+      if (FKN._mc) {
+        try { FKN._mc.port1.onmessage = null } catch (e) {}
+        try { FKN._mc.port1.close() } catch (e) {}
+        try { FKN._mc.port2.close() } catch (e) {}
+        FKN._mc = null
+      }
+      FKN.pendingTick = false
+      FKN.tickIdle = true
+      // closeFd deletes as it goes, so iterate a copy
+      for (const fd of [...FKN.fds.keys()]) FKN.closeFd(fd)
+      FKN.initialized = false
+    },
+
     stats: {
       socket: 0, bind: 0, listen: 0, accept: 0, connect: 0, close: 0,
       recv: 0, recvfrom: 0, send: 0, sendto: 0,

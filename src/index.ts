@@ -105,6 +105,44 @@ export interface Alert {
   message: string
 }
 
+/** One inbound connection, as libtorrent saw it arrive. */
+export interface InboundPeer {
+  /** "1.2.3.4:5678", exactly as libtorrent printed it. */
+  endpoint: string
+  /** Lowercased socket type: "tcp", "utp", "socks5", "http". */
+  transport: string
+  /** Date.now() at the pump that observed it. */
+  at: number
+}
+
+/**
+ * Whether anyone can reach this session, derived from alerts rather than from a new binding.
+ *
+ * Every field here comes from alerts libtorrent already posts under categories already enabled
+ * (wrapper.cpp:326-330), so nothing in the wasm had to change to expose it. It exists because
+ * "is inbound working" was previously unanswerable: the alert stream carried the answer and every
+ * caller drained it and threw it away.
+ */
+export interface Reachability {
+  /** Socket type to the endpoint libtorrent believes it is listening on, e.g. { tcp: "0.0.0.0:6882" }. */
+  listening: Record<string, string>
+  /** Listen failures, as their alert messages. Non-empty means the acceptor never came up. */
+  listenFailed: string[]
+  /** How many peers have dialled in since the session started. */
+  inbound: number
+  /** The same count split by transport, which is what separates a working uTP path from a working TCP one. */
+  inboundByTransport: Record<string, number>
+  /** The most recent inbound connection, or null if nobody has ever dialled in. */
+  lastInbound: InboundPeer | null
+}
+
+// libtorrent/src/alert.cpp:1733, :1290 and :1179. The socket type names are capitalised
+// ("TCP", "uTP", libtorrent/src/socket_type.cpp:47-51), so every transport read here is lowercased
+// at the point of capture rather than matched case-sensitively.
+const INCOMING_RE = /^incoming connection from (\S+) \(([^)]*)\)/
+const LISTENING_RE = /^successfully listening on \[([^\]]*)\] (\S+)/
+const LISTEN_FAILED_RE = /^listening on .* failed:/
+
 const utf8 = new TextDecoder()
 
 // Binary record ids the wrapper appends to the alert stream (see wrapper.cpp).
@@ -198,6 +236,8 @@ export class Session {
   // handle -> piece -> how many in-flight read()s deadlined it, so an abandoned read only retires
   // the deadlines nothing else is still waiting on
   private deadlineRefs = new Map<number, Map<number, number>>()
+
+  private reachability: Reachability = { listening: {}, listenFailed: [], inbound: 0, inboundByTransport: {}, lastInbound: null }
 
   constructor(mod: LtModule, options: SessionOptions) {
     this.mod = mod
@@ -710,7 +750,11 @@ export class Session {
         else if (type === REC_STATE_UPDATE) this.decodeStateUpdate(view, off)
         else if (type === REC_RESUME_DATA) this.decodeResumeData(view, off, len)
         else if (type === REC_READ_PIECE) { /* fallback path - no MVP consumer */ }
-        else out.push({ type, message: m.UTF8ToString(start + off, len) })
+        else {
+          const alert = { type, message: m.UTF8ToString(start + off, len) }
+          this.observeReachability(alert.message)
+          out.push(alert)
+        }
         off += len
       }
     } finally {
@@ -720,6 +764,44 @@ export class Session {
       this.resolvePieceWaiters()
     }
     return out
+  }
+
+  /**
+   * Whether anything can reach this session. Read it, do not poll a socket for it.
+   *
+   * Updated as a side effect of popAlerts, so a caller that pumps alerts gets this for free and one
+   * that does not gets an honestly empty answer. `listening` empty means no acceptor ever came up;
+   * `inbound` zero with `listening` populated means the acceptor is up and nobody has dialled it,
+   * which is the distinction that decides whether to look at the engine or at the network.
+   */
+  reachable(): Reachability {
+    return {
+      listening: { ...this.reachability.listening },
+      listenFailed: [...this.reachability.listenFailed],
+      inbound: this.reachability.inbound,
+      inboundByTransport: { ...this.reachability.inboundByTransport },
+      lastInbound: this.reachability.lastInbound,
+    }
+  }
+
+  private observeReachability(message: string) {
+    const incoming = INCOMING_RE.exec(message)
+    if (incoming) {
+      const transport = incoming[2]!.toLowerCase()
+      this.reachability.inbound++
+      this.reachability.inboundByTransport[transport] = (this.reachability.inboundByTransport[transport] ?? 0) + 1
+      this.reachability.lastInbound = { endpoint: incoming[1]!, transport, at: Date.now() }
+      return
+    }
+    const listening = LISTENING_RE.exec(message)
+    if (listening) {
+      this.reachability.listening[listening[1]!.toLowerCase()] = listening[2]!
+      return
+    }
+    // bounded: a listener that flaps would otherwise grow this without limit for the session's life
+    if (LISTEN_FAILED_RE.test(message) && this.reachability.listenFailed.length < 32) {
+      this.reachability.listenFailed.push(message)
+    }
   }
 
   private decodeResumeData(view: DataView, off: number, len: number) {
@@ -818,6 +900,10 @@ export class Session {
     this.deadlineRefs.clear()
     this.priosByHandle.clear()
     this.mod._lt_session_destroy()
+    // After the session is gone, because closing the tick channel first would strand any work
+    // _lt_session_destroy still wants to schedule. The shim publishes itself as Module.__FKN
+    // (library_fkn.js:182); the optional chain covers a module that never reached init().
+    ;(this.mod as unknown as { __FKN?: { teardown?: () => void } }).__FKN?.teardown?.()
   }
 }
 
