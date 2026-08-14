@@ -62,6 +62,48 @@ window.addEventListener('unhandledrejection', e => log('unhandled: ' + (e.reason
     return rc
   }
 
+  /**
+   * Standing record of who dialled in, for the reachability measurement.
+   *
+   * Auto-drained on a timer, because __drain() clears the buffer and a hand-driven poll loses every
+   * alert that landed between calls. Everything drained here is pushed to __alertLog too, so
+   * __drain() stays useful for anything else.
+   *
+   * Formats are libtorrent/src/alert.cpp:1733, :1290 and :1179. Socket type names are capitalised
+   * ("TCP", "uTP", socket_type.cpp:47-51), hence the lowercasing.
+   */
+  const inbound: any[] = []
+  const listening: Record<string, string> = {}
+  const dialled = new Set<string>()
+  const alertLog: any[] = []
+  ;(window as any).__alertLog = alertLog
+  ;(window as any).__inbound = () => ({
+    listening,
+    inbound: inbound.length,
+    byTransport: inbound.reduce((n: any, c: any) => ({ ...n, [c.transport]: (n[c.transport] ?? 0) + 1 }), {}),
+    peers: inbound,
+    // an endpoint we dialled ourselves is not evidence of reachability, so keep the two apart
+    dialledOut: dialled.size,
+    inboundNotDialled: inbound.filter((c: any) => !dialled.has(c.endpoint)).length,
+  })
+
+  setInterval(() => {
+    for (const a of (window as any).__drain()) {
+      alertLog.push(a)
+      if (alertLog.length > 5000) alertLog.shift()
+      const m = String(a.m ?? '')
+      const inc = /^incoming connection from (\S+) \(([^)]*)\)/.exec(m)
+      if (inc) { inbound.push({ at: Date.now(), endpoint: inc[1], transport: inc[2].toLowerCase() }); continue }
+      const lis = /^successfully listening on \[([^\]]*)\] (\S+)/.exec(m)
+      if (lis) { listening[lis[1].toLowerCase()] = lis[2]; continue }
+      // peer_connect_alert is "<torrent> peer [ <endpoint> client: <id> ] outgoing connection to
+      // peer (TCP)" (alert.cpp:154 and :1753). Matching on the words rather than a position,
+      // because the torrent name and the client string are both free text.
+      const out = /peer \[ (\S+) client: .*? \] outgoing connection to peer/.exec(m)
+      if (out) dialled.add(out[1])
+    }
+  }, 1000)
+
   setInterval(() => (inst as any).__FKN.scheduleTick(), 1000)
   ;(window as any).__status = () => {
     const fkn = (inst as any).__FKN
