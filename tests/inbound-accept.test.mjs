@@ -20,9 +20,6 @@ import test from 'node:test'
 import { Rig } from './rig/harness.mjs'
 import { magnetFor, makeTorrent, writeFixture } from './rig/make-torrent.mjs'
 
-/** wrapper.cpp:276 pins listen_interfaces to this, which is what makes the dial below possible. */
-const LISTEN_PORT = 6882
-
 const PROTOCOL = 'BitTorrent protocol'
 
 /** BEP 3: 1 byte pstrlen, 19 byte pstr, 8 reserved, 20 infohash, 20 peer id. */
@@ -84,8 +81,20 @@ test('an inbound peer reaches libtorrent through accept()', async (t) => {
     'listen_succeeded_alert',
     () => rig.metrics.listening.tcp,
   )
-  assert.match(endpoint, new RegExp(`:${LISTEN_PORT}$`), `listening on ${endpoint}`)
   assert.equal(rig.metrics.listenFailed.length, 0, 'a listen failed')
+
+  /**
+   * The port is reserved before the session exists and libtorrent is told to listen on it, so the
+   * announced port and the port something is actually bound to are the same number. Asserting they
+   * agree is the whole point: the engine used to announce a hardcoded 6882 that nothing listened
+   * on, which is why inbound TCP was dark. A mismatch here means the announce is a fiction again.
+   *
+   * Dialling the reserved port rather than a constant is also what keeps this test honest, since a
+   * constant would pass against an engine listening somewhere else entirely.
+   */
+  const LISTEN_PORT = rig.session.reachable().port
+  assert.ok(LISTEN_PORT, 'no port was reserved, so there is nothing for a peer to dial')
+  assert.match(endpoint, new RegExp(`:${LISTEN_PORT}$`), `listening on ${endpoint}, reserved ${LISTEN_PORT}`)
 
   /**
    * The acceptor being up is NOT enough: wait until the torrent is registered.

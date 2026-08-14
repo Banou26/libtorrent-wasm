@@ -11,10 +11,13 @@
 //
 // Every trial gets its OWN seeder fleet, not just a fresh download directory.
 //
-// Sharing a fleet looks like an easy saving and silently destroys the run. The
-// engine always listens on 0.0.0.0:6882 (wrapper.cpp pins it), so trial 2 looks
-// to a seeder like the same peer that just vanished, and transmission applies
-// its reconnect backoff to it. Measured on one shared fleet: 10.5 s, 37.0 s,
+// Sharing a fleet looks like an easy saving and silently destroys the run. When
+// this was measured the engine always listened on 0.0.0.0:6882, so trial 2 looked
+// to a seeder like the same peer that just vanished, and transmission applied
+// its reconnect backoff to it. Each session now reserves its own port, which
+// weakens that particular mechanism but not the conclusion: a seeder still
+// remembers the previous trial's peer by address, and the fleet is cheap.
+// Measured on one shared fleet: 10.5 s, 37.0 s,
 // 42.0 s, 8.5 s, 28.0 s to first byte, with one trial not seeing a peer for
 // 33 s. With a fleet per trial the same measurement is stable.
 

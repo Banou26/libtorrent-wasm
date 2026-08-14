@@ -136,7 +136,9 @@ export class Rig {
       return
     }
 
-    // "successfully listening on [TCP] 0.0.0.0:6882"  (alert.cpp:1290)
+    // "successfully listening on [TCP] 0.0.0.0:40989"  (alert.cpp:1290); the port is the one
+    // reserved on the relay before the session started, so it differs run to run
+
     const listening = /^successfully listening on \[([^\]]*)\] (\S+)/.exec(m)
     if (listening) {
       this.metrics.listening[listening[1].toLowerCase()] = listening[2]
