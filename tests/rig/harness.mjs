@@ -47,8 +47,14 @@ export class Rig {
     reads: [],
     stalls: [],
     timeline: [],
-    alerts: { hashFailed: 0, peerError: 0, peerBan: 0 },
+    alerts: { hashFailed: 0, peerError: 0, peerBan: 0, incoming: 0 },
     maxPeers: 0,
+    /** Every inbound connection, as { at, endpoint, transport }. Empty is a real answer. */
+    incoming: [],
+    /** The endpoint libtorrent believes it is listening on, per socket type, from the alert. */
+    listening: {},
+    /** Failures, so a listener that never came up is distinguishable from one nobody dialled. */
+    listenFailed: [],
   }
 
   #enableDht
@@ -102,11 +108,51 @@ export class Rig {
     return this
   }
 
+  /**
+   * Classify on the MESSAGE, never on the type.
+   *
+   * `type` is libtorrent's numeric alert id (see the Alert interface in src/index.ts), so the
+   * regexes this used to run against `String(a.type)` were matching words against "42" and every
+   * counter here was permanently zero. That is worse than having no counters: a run reports
+   * hashFailed 0 whether or not a piece failed, which reads as a clean run.
+   *
+   * The patterns below are the real formats, from libtorrent/src/alert.cpp. Note the socket type
+   * names are "TCP" and "uTP", capitalised (libtorrent/src/socket_type.cpp:47-51), so the
+   * transport match is case-insensitive on purpose: a case-sensitive /\(utp\)/ would reproduce
+   * exactly the silent zero this replaces.
+   */
   #onAlert(a) {
-    const t = String(a?.type ?? '')
-    if (/hash_failed/.test(t)) this.metrics.alerts.hashFailed++
-    else if (/peer_ban|ip_block/.test(t)) this.metrics.alerts.peerBan++
-    else if (/peer_error|peer_disconnected/.test(t)) this.metrics.alerts.peerError++
+    const m = String(a?.message ?? '')
+
+    // "incoming connection from 1.2.3.4:5678 (uTP)"  (alert.cpp:1733)
+    const incoming = /^incoming connection from (\S+) \(([^)]*)\)/.exec(m)
+    if (incoming) {
+      this.metrics.alerts.incoming++
+      this.metrics.incoming.push({
+        at: Date.now() - this.#startedAt,
+        endpoint: incoming[1],
+        transport: incoming[2].toLowerCase(),
+      })
+      return
+    }
+
+    // "successfully listening on [TCP] 0.0.0.0:6882"  (alert.cpp:1290)
+    const listening = /^successfully listening on \[([^\]]*)\] (\S+)/.exec(m)
+    if (listening) {
+      this.metrics.listening[listening[1].toLowerCase()] = listening[2]
+      return
+    }
+
+    // "listening on <endpoint> (device: <iface>) failed: ..."  (alert.cpp:1179)
+    if (/^listening on .* failed:/.test(m)) {
+      this.metrics.listenFailed.push({ at: Date.now() - this.#startedAt, message: m })
+      return
+    }
+
+    if (/hash for piece \d+ failed/.test(m)) this.metrics.alerts.hashFailed++
+    // "<peer> banned peer" (alert.cpp:610) and "<peer>: blocked peer [ip_filter]" (alert.cpp:1437)
+    else if (/banned peer|blocked peer/.test(m)) this.metrics.alerts.peerBan++
+    else if (/peer error|disconnecting/.test(m)) this.metrics.alerts.peerError++
   }
 
   #sample(h) {
@@ -288,6 +334,13 @@ export class Rig {
       maxPeers: m.maxPeers,
       peakRate: Math.max(0, ...m.timeline.map((t) => t.downloadRate ?? 0)),
       alerts: m.alerts,
+      // What the engine believes it is listening on, and who actually dialled in. `listening`
+      // empty means no listen_succeeded_alert ever arrived, which is a different failure from
+      // `incoming` empty, which means nobody dialled a listener that did come up.
+      listening: { ...m.listening },
+      listenFailed: m.listenFailed.length,
+      incoming: m.incoming.length,
+      incomingByTransport: m.incoming.reduce((n, c) => ({ ...n, [c.transport]: (n[c.transport] ?? 0) + 1 }), {}),
       socketErrors: { ...this.#host.stats },
     }
   }
