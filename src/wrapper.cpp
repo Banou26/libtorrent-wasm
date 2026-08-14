@@ -420,11 +420,15 @@ LT_API int lt_diag_listen_port() {
   return g_session->ses->listen_port();
 }
 
+// Reopens the listen sockets. Was a no-op: it re-applied the SAME listen_interfaces string, and
+// apply_settings_pack_impl gates the reopen on setting_changed<std::string>(...) for exactly that
+// setting (session_impl.cpp:1562), which is false when the value is unchanged. So the one thing
+// this function exists to do never happened. reopen_network_sockets calls it directly.
+// Empty flags rather than the default reopen_map_ports: UPnP and NAT-PMP are both off here
+// (settings above), so asking to remap ports would be work with nothing to map.
 LT_API void lt_diag_force_reopen() {
   if (!g_session) return;
-  lt::settings_pack sp;
-  sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6882");
-  g_session->ses->apply_settings(std::move(sp));
+  g_session->ses->reopen_network_sockets({});
 }
 
 #include "libtorrent/string_util.hpp"
