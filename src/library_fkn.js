@@ -82,7 +82,7 @@ addToLibrary({
     },
 
     stats: {
-      socket: 0, bind: 0, listen: 0, accept: 0, connect: 0, close: 0,
+      socket: 0, bind: 0, listen: 0, accept: 0, acceptEmpty: 0, acceptQueued: 0, connect: 0, close: 0,
       recv: 0, recvfrom: 0, send: 0, sendto: 0,
       poll: 0, pollReady: 0, pollCalls: 0,
       setsockopt: 0, getsockopt: 0, getsockname: 0, getpeername: 0, fcntl: 0, ioctl: 0,
@@ -125,6 +125,68 @@ addToLibrary({
       // marked before tearing it down, so the close handler reads this as the fd going away rather than an outage worth reopening for
       s.closed = true
       FKN.closeState(s)
+    },
+
+    /**
+     * The four endpoints of an accepted socket, or null while it cannot yet name its peer.
+     *
+     * Read ONE PROPERTY AT A TIME. node answers `undefined` for an endpoint it does not have, but
+     * @fkn/lib's Socket THROWS `Socket is not connected` from every address getter until the
+     * promise behind it resolves, so a single try block around all six abandons the other five on
+     * the first throw and the fd ends up with no remote address at all.
+     */
+    endpointsOf(sock) {
+      const read = (name) => { try { return sock[name] } catch (e) { return undefined } }
+      const remoteAddr = read('remoteAddress')
+      if (!remoteAddr) return null
+      return {
+        localAddr: read('localAddress'),
+        localPort: read('localPort'),
+        localFamily: read('localFamily'),
+        remoteAddr,
+        remotePort: read('remotePort'),
+        remoteFamily: read('remoteFamily'),
+      }
+    },
+
+    // ~1 second. The endpoints land on the next microtask in practice, so this is a bound on a
+    // socket that will never name its peer rather than a schedule anything waits out.
+    ACCEPT_ENDPOINT_ATTEMPTS: 64,
+
+    /**
+     * Hand an accepted socket to libtorrent, but never before it can name its peer.
+     *
+     * node fills an accepted socket's endpoints in BEFORE it emits 'connection'. @fkn/lib does not:
+     * its Server builds the Socket from a promise and publishes the endpoints in a `.then()` while
+     * the emit is synchronous, so for at least one microtask every address getter throws. Measured
+     * in a browser against the live relay on 2026-08-15, on every accepted socket, in every realm.
+     *
+     * That matters because libtorrent calls remote_endpoint() the instant it accepts and, when the
+     * call fails, returns with NO alert and NO reply (libtorrent/src/session_impl.cpp:2989). A peer
+     * would see its connection accepted and then silence, which is indistinguishable from the relay
+     * never delivering it. Snapshot the endpoints once they read, and let accept() serve them from
+     * the snapshot rather than from a getter whose timing it does not control.
+     */
+    queueAccepted(st, sock) {
+      const ready = FKN.endpointsOf(sock)
+      if (ready) { FKN.pushAccepted(st, sock, ready); return }
+      let attempts = 0
+      const retry = () => {
+        const endpoints = FKN.endpointsOf(sock)
+        if (endpoints) { FKN.pushAccepted(st, sock, endpoints); return }
+        if (++attempts > FKN.ACCEPT_ENDPOINT_ATTEMPTS) { try { sock.destroy() } catch (e) {} ; return }
+        setTimeout(retry, 16)
+      }
+      queueMicrotask(retry)
+    },
+
+    pushAccepted(st, sock, endpoints) {
+      // the listen fd can be closed while a socket waits for its endpoints, and nothing would ever
+      // drain a queue whose owner is gone
+      if (st.kind !== 'tcp-listen' || st.closed) { try { sock.destroy() } catch (e) {} ; return }
+      st.acceptQueue.push({ sock, endpoints })
+      FKN.stats.acceptQueued++
+      FKN.scheduleTick()
     },
 
     // the datagram socket under a udp fd does not survive losing the connection, so the fd keeps its identity and the socket underneath is replaced, re-bound to the same local port
@@ -461,15 +523,16 @@ addToLibrary({
     // them rather than dropping them, so a peer that dialled during startup still gets served. The
     // splice and the flag both run here, synchronously, so no connection can land in between.
     st.acceptQueue = []
+    let backlog = []
     if (adopt) {
       pre.serverTaken = true
       pre.adopted = true
-      st.acceptQueue = pre.backlog.splice(0)
+      backlog = pre.backlog.splice(0)
     }
-    server.on('connection', (sock) => {
-      st.acceptQueue.push(sock)
-      FKN.scheduleTick()
-    })
+    server.on('connection', (sock) => FKN.queueAccepted(st, sock))
+    // through queueAccepted like any other, so a parked socket is snapshotted the same way; theirs
+    // resolved long ago, so each takes the synchronous path
+    for (const sock of backlog) FKN.queueAccepted(st, sock)
     server.on('error', (err) => {
       st.error = err.errno || FKN.err.IO
       FKN.scheduleTick()
@@ -493,20 +556,20 @@ addToLibrary({
   $FKN_accept(fd, addrPtr, addrLenPtr) {
     const st = FKN.fds.get(fd)
     if (!st || st.kind !== 'tcp-listen') return -FKN.err.BADF
-    const sock = st.acceptQueue.shift()
-    if (!sock) return -FKN.err.AGAIN
+    const accepted = st.acceptQueue.shift()
+    // Counted because its absence is not neutral: with no counter here, "did libtorrent ever call
+    // accept?" is unanswerable from outside, and a zero read off stats.accept looks like an answer
+    // while meaning nothing. It cost a wrong diagnosis on 2026-08-15.
+    if (!accepted) { FKN.stats.acceptEmpty++; return -FKN.err.AGAIN }
+    FKN.stats.accept++
+    // the endpoints were snapshotted by queueAccepted, which is what guarantees this fd can answer
+    // getpeername; reading the getters here would put that back at the mercy of the host's timing
+    const { sock, endpoints } = accepted
     const newSt = {
       kind: 'tcp', family: st.family, nonblock: false,
       socket: sock, connected: true,
+      ...endpoints,
     }
-    try {
-      newSt.localAddr = sock.localAddress
-      newSt.localPort = sock.localPort
-      newSt.localFamily = sock.localFamily
-      newSt.remoteAddr = sock.remoteAddress
-      newSt.remotePort = sock.remotePort
-      newSt.remoteFamily = sock.remoteFamily
-    } catch (e) {}
     const newFd = FKN.newFd(newSt)
     sock.on('data', (chunk) => {
       // CRITICAL: copy the chunk - @fkn/lib's TCP stream re-uses backing buffers across reads, and stashing the original surfaces as hash-piece-failed alerts and instant peer bans

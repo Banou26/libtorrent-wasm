@@ -317,7 +317,13 @@ test('a connection accepted before the session existed is not dropped', () => {
   const dgram = makeDgram(PORT)
   const net = makeNet()
   const pre = prebound(net, dgram)
-  const early = { id: 'dialled during startup' }
+  // a socket, not a marker object: the queue now carries the endpoint snapshot beside it, and a
+  // socket that cannot name its peer is deliberately held back rather than queued
+  const early = {
+    id: 'dialled during startup',
+    localAddress: '0.0.0.0', localPort: PORT, localFamily: 'IPv4',
+    remoteAddress: '203.0.113.7', remotePort: 51413, remoteFamily: 'IPv4',
+  }
   pre.backlog.push(early)
   const { FKN, library } = loadShim({ net, dgram, storage: null, prebound: pre })
 
@@ -325,7 +331,9 @@ test('a connection accepted before the session existed is not dropped', () => {
   const fd = FKN.newFd(st)
   library.$FKN_listen(fd)
 
-  assert.deepEqual(st.acceptQueue, [early], 'the parked connection was lost')
+  assert.equal(st.acceptQueue.length, 1, 'the parked connection was lost')
+  assert.equal(st.acceptQueue[0].sock, early)
+  assert.equal(st.acceptQueue[0].endpoints.remoteAddr, '203.0.113.7')
   assert.deepEqual(pre.backlog, [], 'the backlog was not drained')
 })
 
@@ -387,4 +395,98 @@ test('a reopen keeps the port once, then takes whatever is free', async () => {
   assert.deepEqual(dgram.sockets[2].bindCalls, [{ port: 0, address: '0.0.0.0' }],
     'kept asking for a port the relay had already refused')
   st.closed = true
+})
+
+// ------------------------------------------------------- naming the peer that dialled in
+
+/**
+ * @fkn/lib's Socket, in the one respect the shim depends on and node does not share.
+ *
+ * node fills an accepted socket's four endpoints in BEFORE it emits 'connection', so a consumer
+ * reading them in that handler gets real values. @fkn/lib builds the Socket from a promise and
+ * publishes them in a `.then()` while the emit is synchronous, and until that lands every address
+ * getter THROWS `Socket is not connected` rather than answering undefined
+ * (fkn/web src/lib/webvpn/net.ts:310-335 and :420-423). Measured in a browser against the live
+ * relay on 2026-08-15, on every accepted socket, in both the page and the worker realm.
+ */
+const lateEndpointSocket = (publish) => {
+  const endpoints = {
+    localAddress: '0.0.0.0', localPort: PORT, localFamily: 'IPv4',
+    remoteAddress: '198.51.100.9', remotePort: 6881, remoteFamily: 'IPv4',
+  }
+  let published = false
+  publish(() => { published = true })
+  const sock = new EventEmitter()
+  sock.destroyed = false
+  sock.destroy = () => { sock.destroyed = true }
+  for (const [name, value] of Object.entries(endpoints)) {
+    Object.defineProperty(sock, name, {
+      get() {
+        if (!published) throw new Error('Socket is not connected')
+        return value
+      },
+    })
+  }
+  return sock
+}
+
+const listenFd = (FKN, library, net) => {
+  const st = { kind: 'tcp-unbound', family: 'IPv4', nonblock: false, pendingBindPort: PORT, pendingBindAddr: '0.0.0.0' }
+  const fd = FKN.newFd(st)
+  assert.equal(library.$FKN_listen(fd), 0)
+  return { st, fd, server: net.servers[net.servers.length - 1] }
+}
+
+/**
+ * The regression. libtorrent calls remote_endpoint() the instant it accepts and, when that fails,
+ * returns with NO alert and NO reply (libtorrent/src/session_impl.cpp:2989), so an accepted fd that
+ * cannot name its peer is a peer whose connection is accepted and then hears nothing back. That is
+ * indistinguishable, from outside, from the relay never delivering the connection at all.
+ *
+ * Before this, accept() read all six endpoints inside ONE try block, so the first throw abandoned
+ * the other five and the fd was left with no remote address whatsoever.
+ */
+test('an accepted socket is never handed over before it can name its peer', async () => {
+  const dgram = makeDgram(PORT)
+  const net = makeNet()
+  const { FKN, library, heap } = loadShim({ net, dgram, storage: null })
+  const { st, fd, server } = listenFd(FKN, library, net)
+
+  let release = () => {}
+  const sock = lateEndpointSocket((ready) => { release = ready })
+  server.emit('connection', sock)
+
+  // a whole macrotask later and still unreadable: nothing may have been queued
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(st.acceptQueue.length, 0, 'a socket that cannot name its peer was queued')
+  assert.equal(library.$FKN_accept(fd, ADDR_PTR, 0), -FKN.err.AGAIN)
+
+  release()
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  assert.equal(st.acceptQueue.length, 1, 'the socket was never queued once its endpoints landed')
+
+  const newFd = library.$FKN_accept(fd, ADDR_PTR, 0)
+  assert.ok(newFd > 0, `accept failed with ${newFd}`)
+  const accepted = FKN.fds.get(newFd)
+  assert.equal(accepted.remoteAddr, '198.51.100.9')
+  assert.equal(accepted.remotePort, 6881)
+  assert.equal(accepted.localPort, PORT)
+  // what libtorrent actually calls: a null answer here is the silent drop this test exists for
+  assert.equal(library.$FKN_getpeername(newFd, ADDR_PTR, 0), 0)
+  assert.equal(heap[ADDR_PTR + 4], 198)
+})
+
+test('a socket whose endpoints never land is dropped rather than queued', async () => {
+  const dgram = makeDgram(PORT)
+  const net = makeNet()
+  const { FKN, library } = loadShim({ net, dgram, storage: null })
+  FKN.ACCEPT_ENDPOINT_ATTEMPTS = 2
+  const { st, server } = listenFd(FKN, library, net)
+
+  const sock = lateEndpointSocket(() => {})
+  server.emit('connection', sock)
+
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  assert.equal(st.acceptQueue.length, 0)
+  assert.equal(sock.destroyed, true, 'the socket was leaked instead of being closed')
 })

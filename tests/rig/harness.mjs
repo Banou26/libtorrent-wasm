@@ -59,9 +59,13 @@ export class Rig {
 
   #enableDht
 
-  constructor({ storageDir, debug = false, enableDht = false }) {
+  /**
+   * `host` overrides the node net/dgram pair. The default is the plain one; a test that needs to
+   * reproduce a host whose sockets behave differently from node's passes its own.
+   */
+  constructor({ storageDir, debug = false, enableDht = false, host = null }) {
     this.#storage = new NodeFSStorage(storageDir)
-    this.#host = createNodeHost()
+    this.#host = host ?? createNodeHost()
     this.#debug = debug
     // Off by default here, the opposite of production. A rig that joins the DHT
     // announces its fixture's infohash publicly and gets real peers back for it,
