@@ -490,3 +490,97 @@ test('a socket whose endpoints never land is dropped rather than queued', async 
   assert.equal(st.acceptQueue.length, 0)
   assert.equal(sock.destroyed, true, 'the socket was leaked instead of being closed')
 })
+
+// ---------------------------------------------------------------- healing a dropped acceptor
+
+/**
+ * A relay session that goes away takes the listening socket with it. The UDP fd heals itself
+ * through reopenUdp; a listening fd had no equivalent, so a single dropped tunnel ended inbound TCP
+ * for the life of the page while libtorrent went on announcing a port nothing was bound to.
+ *
+ * The port is reclaimed BY NAME here, which the ordinary bind path never does, because trackers,
+ * PEX and the DHT have already published this number. Moving is the fallback, not the default.
+ */
+test('a listener that closes is reopened on the port peers already know', async () => {
+  const dgram = makeDgram(PORT)
+  const net = makeNet()
+  const { FKN, library } = loadShim({ net, dgram, storage: null })
+  const { st, server } = listenFd(FKN, library, net)
+  st.localPort = PORT
+  st.localAddr = '0.0.0.0'
+  assert.equal(net.servers.length, 1)
+
+  server.emit('close')
+  await new Promise((resolve) => setTimeout(resolve, 400))
+
+  assert.equal(net.servers.length, 2, 'no replacement acceptor was created')
+  assert.notEqual(st.server, server, 'the fd still points at the dead acceptor')
+  assert.deepEqual(net.servers[1].listenCalls, [{ port: PORT, address: '0.0.0.0' }],
+    'the replacement gave up the port trackers and the DHT already carry')
+  st.closed = true
+})
+
+test('a stale acceptor cannot feed the fd that replaced it', async () => {
+  const dgram = makeDgram(PORT)
+  const net = makeNet()
+  const { FKN, library } = loadShim({ net, dgram, storage: null })
+  const { st, server } = listenFd(FKN, library, net)
+  st.localPort = PORT
+
+  server.emit('close')
+  await new Promise((resolve) => setTimeout(resolve, 400))
+
+  // the dead acceptor emits one last connection; it must not land in the live fd's queue
+  const orphan = { destroy() { this.destroyed = true }, on() {}, remoteAddress: '203.0.113.5', remotePort: 5, remoteFamily: 'IPv4', localAddress: '0.0.0.0', localPort: PORT, localFamily: 'IPv4' }
+  server.emit('connection', orphan)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  assert.equal(st.acceptQueue.length, 0, 'a dead acceptor queued a socket on the live fd')
+  assert.equal(orphan.destroyed, true, 'the orphan socket was leaked')
+  st.closed = true
+})
+
+test('a listener that cannot reclaim its port eventually takes any port', async () => {
+  const dgram = makeDgram(PORT)
+  // a relay that refuses the named port and grants only ephemeral ones, which is what a port still
+  // held by the socket we just dropped looks like from here
+  const servers = []
+  const net = {
+    servers,
+    createServer() {
+      const srv = new EventEmitter()
+      srv.listenCalls = []
+      srv.listen = (port, address) => {
+        srv.listenCalls.push({ port, address })
+        setImmediate(() => {
+          if (port !== 0) srv.emit('error', Object.assign(new Error('Address already in use'), { errno: 29 }))
+          else { srv.granted = 45678; srv.emit('listening') }
+        })
+      }
+      srv.close = () => {}
+      srv.address = () => ({ address: '0.0.0.0', port: srv.granted ?? PORT, family: 'IPv4' })
+      servers.push(srv)
+      return srv
+    },
+  }
+  const { FKN, library } = loadShim({ net, dgram, storage: null })
+  const st = { kind: 'tcp-unbound', family: 'IPv4', nonblock: false, pendingBindPort: PORT, pendingBindAddr: '0.0.0.0' }
+  const fd = FKN.newFd(st)
+  library.$FKN_listen(fd)
+  // the fake answers 'listening' on a later turn, exactly as a real relay does
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  // the initial listen asks for 0 and is granted 45678, so THAT is the number peers learn and the
+  // one a reopen has to try to reclaim
+  assert.equal(st.localPort, 45678, 'the fd did not adopt the granted port')
+
+  servers[0].emit('close')
+  // 250ms then 1000ms both retry the held number and are refused; the third waits 3000ms and takes any
+  await new Promise((resolve) => setTimeout(resolve, 5200))
+
+  const reclaims = servers.filter((s) => s.listenCalls.some((c) => c.port === 45678))
+  const ephemeral = servers.slice(1).filter((s) => s.listenCalls.some((c) => c.port === 0))
+  assert.ok(reclaims.length >= 1, 'never tried to reclaim the published port; calls=' + JSON.stringify(servers.map(x => x.listenCalls)))
+  assert.ok(ephemeral.length >= 1, 'kept asking for a port the relay had already refused; calls=' + JSON.stringify(servers.map(x => x.listenCalls)))
+  st.closed = true
+})

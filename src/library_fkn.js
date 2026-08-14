@@ -189,6 +189,75 @@ addToLibrary({
       FKN.scheduleTick()
     },
 
+    /**
+     * Handlers for a listening server, guarded on identity so a replaced server's late events
+     * cannot reach the state that now owns its successor. Shared by listen() and the reopen.
+     */
+    wireListener(st, server) {
+      const mine = () => st.server === server
+      server.on('connection', (sock) => {
+        if (!mine()) { try { sock.destroy() } catch (e) {} ; return }
+        FKN.queueAccepted(st, sock)
+      })
+      server.on('error', (err) => {
+        if (!mine()) return
+        st.error = err.errno || FKN.err.IO
+        FKN.scheduleTick()
+        FKN.reopenListen(st, 'error')
+      })
+      // a dropped tunnel usually looks like a clean close rather than an error, exactly as for udp
+      server.on('close', () => { if (mine()) FKN.reopenListen(st, 'close') })
+      server.on('listening', () => {
+        if (!mine()) return
+        // a healed acceptor starts its backoff over, so a later drop is not punished for this one
+        st.listenReopenAttempts = 0
+        // getsockname answers from here, so it has to name the port that is really held; libtorrent
+        // snapshotted the original at startup and cannot be told, which is why the reopen tries to
+        // reclaim the same number first
+        try {
+          const a = server.address()
+          if (a) { st.localAddr = a.address; st.localPort = a.port; st.localFamily = a.family }
+        } catch (e) {}
+      })
+    },
+
+    LISTEN_REOPEN_DELAYS: [250, 1000, 3000, 10000, 30000],
+
+    /**
+     * Put the acceptor back after the relay session under it goes away.
+     *
+     * Without this a dropped tunnel ends inbound TCP for the life of the page: the UDP fd heals
+     * itself through reopenUdp, but a listening fd had no equivalent, so libtorrent kept announcing
+     * a port nothing was bound to any more and every peer that tried to dial in reached nothing.
+     *
+     * The port is reclaimed by name on purpose, unlike an ordinary bind: trackers, PEX and the DHT
+     * have already published this number, so keeping it is the difference between healing and
+     * silently moving. After a couple of refusals take whatever is free, since an acceptor on the
+     * wrong port still beats none at all.
+     */
+    reopenListen(st, why) {
+      if (st.closed || st.listenReopening || st.kind !== 'tcp-listen') return
+      st.listenReopening = true
+      const attempt = st.listenReopenAttempts || 0
+      st.listenReopenAttempts = attempt + 1
+      const delay = FKN.LISTEN_REOPEN_DELAYS[Math.min(attempt, FKN.LISTEN_REOPEN_DELAYS.length - 1)]
+      console.warn('[FKN] tcp listener ' + why + ', reopening in ' + delay + 'ms (attempt ' + st.listenReopenAttempts + ')')
+      setTimeout(() => {
+        st.listenReopening = false
+        if (st.closed || st.kind !== 'tcp-listen') return
+        const stale = st.server
+        let server
+        try { server = FKN.net.createServer() }
+        catch (e) { FKN.reopenListen(st, 'create-failed'); return }
+        st.server = server
+        FKN.wireListener(st, server)
+        // reassigning st.server first is what disarms the stale server's handlers
+        try { stale?.close?.() } catch (e) {}
+        try { server.listen(attempt > 1 ? 0 : st.localPort, st.localAddr || '0.0.0.0') }
+        catch (e) { FKN.reopenListen(st, 'listen-threw') }
+      }, delay)
+    },
+
     // the datagram socket under a udp fd does not survive losing the connection, so the fd keeps its identity and the socket underneath is replaced, re-bound to the same local port
     UDP_REOPEN_DELAYS: [250, 1000, 3000, 10000, 30000],
 
@@ -529,14 +598,10 @@ addToLibrary({
       pre.adopted = true
       backlog = pre.backlog.splice(0)
     }
-    server.on('connection', (sock) => FKN.queueAccepted(st, sock))
+    FKN.wireListener(st, server)
     // through queueAccepted like any other, so a parked socket is snapshotted the same way; theirs
     // resolved long ago, so each takes the synchronous path
     for (const sock of backlog) FKN.queueAccepted(st, sock)
-    server.on('error', (err) => {
-      st.error = err.errno || FKN.err.IO
-      FKN.scheduleTick()
-    })
     if (adopt) {
       // Already listening. Calling listen() again would ask the relay for a port this very socket
       // is holding, which it would refuse, and the granted address is the truth to report onward.
