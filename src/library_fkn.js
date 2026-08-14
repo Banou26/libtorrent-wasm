@@ -17,6 +17,7 @@ addToLibrary({
       INVAL: 28,
       IO: 29,
       MFILE: 33,
+      NOSYS: 52,
       NOTCONN: 53,
       NOTSOCK: 57,
       TIMEDOUT: 73,
@@ -788,13 +789,22 @@ addToLibrary({
   js_disk_move__deps: ['$FKN'],
   js_disk_move(id, jobLo, jobHi, newPathPtr) {
     const newPath = UTF8ToString(newPathPtr)
-    const finish = (err) => {
+    /**
+     * status_t comes FIRST in libtorrent's reading of the result, so it decides the outcome on its
+     * own: torrent::on_storage_moved (torrent.cpp:8895) treats no_error and need_full_check as
+     * success and adopts `path` as the new save path, consulting the error only in the else branch.
+     * Reporting an errno alongside status 0 therefore records a move that never happened.
+     * Values are storage_defs.hpp:65-71: 0 no_error, 1 fatal_disk_error.
+     */
+    const finish = (err, status) => {
       const ptr = stringToNewUTF8(newPath)
-      Module._lt_disk_complete_move(jobLo, jobHi, ptr, 0, err || 0)
+      Module._lt_disk_complete_move(jobLo, jobHi, ptr, status, err || 0)
       _free(ptr); FKN.scheduleTick()
     }
-    if (!FKN.storage || !FKN.storage.move) { finish(0); return }
-    Promise.resolve(FKN.storage.move(id, newPath)).then(() => finish(0), (e) => finish(e.errno || FKN.err.IO))
+    // A backend with no move hook has not moved anything. Saying otherwise makes libtorrent record
+    // the new save path over data still sitting at the old one, and every later read misses.
+    if (!FKN.storage || !FKN.storage.move) { finish(FKN.err.NOSYS, 1); return }
+    Promise.resolve(FKN.storage.move(id, newPath)).then(() => finish(0, 0), (e) => finish(e.errno || FKN.err.IO, 1))
   },
 
   js_disk_delete__deps: ['$FKN'],
@@ -812,7 +822,9 @@ addToLibrary({
       Module._lt_disk_complete_rename(jobLo, jobHi, ptr, err || 0)
       _free(ptr); FKN.scheduleTick()
     }
-    if (!FKN.storage || !FKN.storage.rename) { finish(0); return }
+    // Same reasoning as js_disk_move: a backend with no rename hook has renamed nothing, and
+    // libtorrent would otherwise record the new name and then look for a file that is not there.
+    if (!FKN.storage || !FKN.storage.rename) { finish(FKN.err.NOSYS); return }
     Promise.resolve(FKN.storage.rename(id, fileIdx, newName)).then(() => finish(0), (e) => finish(e.errno || FKN.err.IO))
   },
 
