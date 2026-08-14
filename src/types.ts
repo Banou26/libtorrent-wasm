@@ -10,6 +10,7 @@ export interface LtModule {
 
   _lt_set_utp_receive_buffer(bytes: number): void
   _lt_set_dht(on: number): void
+  _lt_set_listen_port(port: number): void
   _lt_session_create(): number
   _lt_session_destroy(): void
   _lt_session_tick(): void
@@ -49,10 +50,33 @@ export interface LtModule {
 
 export type LtModuleFactory = (init?: Partial<{ fkn: FknHost; wasmBinary: ArrayBuffer }>) => Promise<LtModule>
 
+/**
+ * A TCP listener and a UDP socket the host bound on the relay, on the same port number, before the
+ * session existed. The shim adopts both instead of binding its own, which is what lets libtorrent
+ * announce a port that something is actually listening on. `backlog` parks connections that arrive
+ * between the reservation and the adoption; `adopted` stops the reservation's own handler once the
+ * shim has taken over. Null when the reservation could not be made.
+ */
+export interface PreboundSockets {
+  port: number
+  /**
+   * Null when the paired TCP bind lost its draw. The announce is then anchored on the UDP port
+   * alone, which still reaches every peer that dials uTP (all of them try it first), and inbound
+   * TCP is dark for the session exactly as it was before any of this.
+   */
+  server: any | null
+  udp: any
+  backlog: any[]
+  adopted?: boolean
+  serverTaken?: boolean
+  udpTaken?: boolean
+}
+
 export interface FknHost {
   net: any
   dgram: any
   storage: StorageBackend | null
+  prebound?: PreboundSockets | null
   /** Turn on the transport and tick traces. Off by default: they run to hundreds of
    *  lines a minute on an ordinary download. */
   debug?: boolean

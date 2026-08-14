@@ -1,4 +1,4 @@
-import type { LtModuleFactory, LtModule, FknHost, StorageBackend } from './types'
+import type { LtModuleFactory, LtModule, FknHost, PreboundSockets, StorageBackend } from './types'
 
 export interface SessionOptions {
   /** @fkn/lib's net module (@fkn/lib/net) */
@@ -20,6 +20,13 @@ export interface SessionOptions {
    *  run to several hundred console lines a minute, which is useful while working on the
    *  transport and noise everywhere else. */
   debug?: boolean
+  /**
+   * Reserve a real listen port before starting the session, so the port the engine announces is one
+   * peers can actually reach. On by default; it costs two relay round trips, overlapped with the
+   * WASM load. Set false to start on an unreachable placeholder port, which leaves inbound TCP
+   * dark but skips the round trips.
+   */
+  reserveListenPort?: boolean
   /**
    * Join the DHT. Defaults to true, which is what a real client wants: it is how a magnet
    * with no live tracker finds anyone at all.
@@ -134,6 +141,12 @@ export interface Reachability {
   inboundByTransport: Record<string, number>
   /** The most recent inbound connection, or null if nobody has ever dialled in. */
   lastInbound: InboundPeer | null
+  /**
+   * The port reserved on the relay and held open for this session, on both TCP and UDP, or null
+   * when no reservation was made. This is the number peers can actually reach, as distinct from
+   * `listening`, which only reports what libtorrent believes.
+   */
+  port: number | null
 }
 
 // libtorrent/src/alert.cpp:1733, :1290 and :1179. The socket type names are capitalised
@@ -237,7 +250,7 @@ export class Session {
   // the deadlines nothing else is still waiting on
   private deadlineRefs = new Map<number, Map<number, number>>()
 
-  private reachability: Reachability = { listening: {}, listenFailed: [], inbound: 0, inboundByTransport: {}, lastInbound: null }
+  private reachability: Reachability = { listening: {}, listenFailed: [], inbound: 0, inboundByTransport: {}, lastInbound: null, port: null }
 
   constructor(mod: LtModule, options: SessionOptions) {
     this.mod = mod
@@ -781,6 +794,7 @@ export class Session {
       inbound: this.reachability.inbound,
       inboundByTransport: { ...this.reachability.inboundByTransport },
       lastInbound: this.reachability.lastInbound,
+      port: this.reachability.port,
     }
   }
 
@@ -877,6 +891,11 @@ export class Session {
     }
   }
 
+  /** Set by createSession once the relay reservation has settled. */
+  setReservedPort(port: number | null) {
+    this.reachability.port = port
+  }
+
   tick() {
     if (this.destroyed) return
     this.mod._lt_session_tick()
@@ -907,6 +926,114 @@ export class Session {
   }
 }
 
+const RESERVE_TIMEOUT_MS = 8000
+
+const shut = (s: any) => { try { s?.close() } catch { /* already gone */ } }
+
+/**
+ * Bind one socket and hand it back once it is listening, or null on refusal or silence.
+ *
+ * `settled` is what makes the hand-off safe. The 'error' listener stays attached to a socket that
+ * succeeds, and errors are ordinary later in its life (a dropped tunnel arrives as one), so without
+ * the guard this closes a socket the shim has already adopted and is relying on.
+ */
+const bindOne = (
+  make: () => any, start: (s: any) => void,
+): Promise<any | null> => new Promise(resolve => {
+  // A host that cannot make this kind of socket is the no-reservation case, not an error: unit
+  // tests hand in stub net/dgram objects, and the engine is expected to start anyway.
+  let sock: any
+  try { sock = make() } catch { resolve(null); return }
+  if (!sock || typeof sock.on !== 'function') { resolve(null); return }
+  let settled = false
+  const fail = () => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    shut(sock)
+    resolve(null)
+  }
+  const timer = setTimeout(fail, RESERVE_TIMEOUT_MS)
+  sock.on('listening', () => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    resolve(sock)
+  })
+  sock.on('error', fail)
+  try { start(sock) } catch { fail() }
+})
+
+/**
+ * Bind a TCP listener and a UDP socket on one shared port number, before the session exists.
+ *
+ * This is what makes the announced port real. libtorrent snapshots a listen socket's endpoint from
+ * getsockname between bind and listen and never refreshes it, and the shim's bind is asynchronous,
+ * so the port has to be known up front or it can never be announced. Reserving it here and having
+ * the shim adopt these exact sockets closes that gap.
+ *
+ * UDP is bound first, on port 0, and TCP then asks for the number the relay granted. That order is
+ * deliberate: the UDP socket carries uTP and the DHT, and the DHT's implied_port makes storing nodes
+ * record the port our datagrams actually came from, so matching TCP to UDP means every route to us,
+ * tracker, PEX and DHT alike, names one working port. TCP and UDP are separate port spaces, so the
+ * match usually lands first try; when it does not, a fresh pair is drawn.
+ */
+export async function reserveListenPort(
+  net: any, dgram: any, attempts = 4,
+): Promise<PreboundSockets | null> {
+  try {
+    return await reserve(net, dgram, attempts)
+  } catch {
+    // Never let a reservation failure stop a session from starting. Without one the engine runs on
+    // the placeholder port with ephemeral relay sockets, which is where it was before any of this.
+    return null
+  }
+}
+
+async function reserve(
+  net: any, dgram: any, attempts: number,
+): Promise<PreboundSockets | null> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const udp = await bindOne(
+      () => dgram.createSocket({ type: 'udp4' }),
+      s => s.bind(0, '0.0.0.0'),
+    )
+    // a refused or silent ephemeral bind means the relay is not granting anything, so stop asking
+    if (!udp) return null
+
+    const port: number | undefined = udp.address?.()?.port
+    if (!port) { shut(udp); return null }
+
+    const server = await bindOne(
+      () => net.createServer(),
+      s => s.listen(port, '0.0.0.0'),
+    )
+    // The relay's contract is bind-exactly-or-fail, so a third answer would put the announce back to
+    // being a fiction; treat a mismatch exactly like a refusal.
+    const granted: number | undefined = server ? server.address?.()?.port : undefined
+    const matched = !!server && granted === port
+    if (server && !matched) shut(server)
+
+    // TCP must never veto UDP. The UDP socket is the one that carries uTP and the DHT, and peers
+    // dial uTP first (libtorrent assumes every peer supports it), so an announce anchored on a UDP
+    // port we really hold is most of the value even with no TCP listener at all. Redraw while there
+    // are attempts left, but on the last one keep the UDP socket and give up only on TCP.
+    if (!matched) {
+      if (attempt < attempts - 1) { shut(udp); continue }
+      return { port, server: null, udp, backlog: [], adopted: false }
+    }
+
+    const reservation: PreboundSockets = { port, server, udp, backlog: [], adopted: false }
+    // Peers cannot know about us before the first announce, so this should stay empty. It is kept
+    // because the cost is one array and the alternative is dropping a real peer on the floor.
+    server.on('connection', (sock: any) => {
+      if (!reservation.adopted) reservation.backlog.push(sock)
+    })
+    return reservation
+  }
+  return null
+}
+
 export async function createSession(options: SessionOptions): Promise<Session> {
   const factory = options.moduleFactory
     // @ts-ignore - generated sibling, resolved at runtime
@@ -918,8 +1045,39 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     storage: options.storage ?? null,
     debug: options.debug ?? false,
   }
+  // started before the module is awaited so the two relay round trips overlap the wasm load
+  const reserving = options.reserveListenPort === false
+    ? Promise.resolve(null)
+    : reserveListenPort(options.net, options.dgram)
+
   const mod: LtModule = await factory({ fkn: host })
   // Before the Session constructor, which creates the session and is itself one of the things that traces.
   mod._lt_set_log(options.debug ? 1 : 0)
-  return new Session(mod, options)
+
+  // Read by the shim at init(), which runs on the first socket() inside _lt_session_create, so
+  // mutating the host object after the factory and before the constructor is in time.
+  const prebound = await reserving
+  if (prebound) {
+    host.prebound = prebound
+    // independent of prebound.server: a UDP-only reservation still makes the announced port real
+    mod._lt_set_listen_port(prebound.port)
+    if (!prebound.server && options.debug) {
+      console.warn(`[fkn] reserved udp ${prebound.port} but no matching tcp listener: inbound uTP works, inbound TCP is dark`)
+    }
+  } else if (options.debug) {
+    console.warn('[fkn] nothing reserved: the announced port is not one anyone can reach')
+  }
+
+  let session: Session
+  try {
+    session = new Session(mod, options)
+  } catch (e) {
+    // The reservation holds two relay sockets. Once adopted they live in the shim's fd table and
+    // teardown closes them, but a session that never got built never adopted anything, so they
+    // would be held for the life of the transport with nothing able to reach them.
+    if (prebound && !prebound.adopted) { shut(prebound.server); shut(prebound.udp) }
+    throw e
+  }
+  session.setReservedPort(prebound ? prebound.port : null)
+  return session
 }

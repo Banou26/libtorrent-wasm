@@ -264,6 +264,28 @@ LT_API void lt_set_dht(int on) {
   g_dht_enabled = on != 0;
 }
 
+// The port named in listen_interfaces. 6882 is a placeholder, not a real port: the shim's bind is
+// asynchronous, so getsockname answers before the relay has granted anything and :0 reads back as a
+// literal 0, which poisons the tracker announce. A fixed non-zero number was the only way to give
+// libtorrent something announceable, at the cost of announcing a port nothing listens on.
+//
+// lt_set_listen_port replaces the placeholder with a port the host has already bound on the relay
+// and is holding open, which is what makes the announced port true and inbound TCP reachable. The
+// host learns it by binding first and passes it here, because libtorrent snapshots a listen
+// socket's local_endpoint from getsockname between bind and listen (session_impl.cpp:1790) and
+// never refreshes it, so a port discovered later can never be announced.
+// Zero, not a placeholder number. With no reservation the interfaces string is "0.0.0.0:0", which
+// announces as port 1 to trackers (make_announce_port, session_impl.cpp:1279) and omits the BEP-10
+// 'p' field entirely (bt_peer_connection.cpp guards on port != 0), so nothing is misdirected. The
+// previous 6882 was worse than useless once the relay began honouring named binds: its port space
+// is shared by every client of a region, so announcing 6882 pointed trackers and PEX at whichever
+// other client happened to be holding it.
+static int g_listen_port = 0;
+// call before lt_session_create(); read once when the settings pack is built
+LT_API void lt_set_listen_port(int port) {
+  if (port >= 0 && port < 65536) g_listen_port = port;
+}
+
 LT_API int lt_session_create() {
   if (g_session) return -1;
 
@@ -271,9 +293,8 @@ LT_API int lt_session_create() {
   g_session->ioc = std::make_unique<lt::io_context>();
 
   lt::settings_pack sp;
-  // one listen interface is required for outgoing connects, on a fixed non-zero port because the async bind reads back as 0 for :0
-  // no host-port conflict between clients: the relay binds its host socket ephemerally and reports 6882 back
-  sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6882");
+  // one listen interface is required for outgoing connects, and for the UDP socket that carries uTP and the DHT
+  sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:" + std::to_string(g_listen_port));
   sp.set_bool(lt::settings_pack::enable_upnp, false);
   sp.set_bool(lt::settings_pack::enable_natpmp, false);
   sp.set_bool(lt::settings_pack::enable_lsd, false);
@@ -415,15 +436,20 @@ LT_API int lt_diag_open_udp() {
   }
 }
 
-LT_API int lt_diag_listen_port() {
-  if (!g_session) return -1;
-  return g_session->ses->listen_port();
-}
+// lt_diag_listen_port() used to live here and was removed rather than fixed. It HUNG THE ENGINE
+// FOREVER: session_handle::listen_port() is a sync_call_ret, which posts onto the io_context and
+// blocks until it answers, and in this single-threaded build that context only runs inside
+// lt_session_tick(). Nothing called it, so the deadlock sat waiting for the first person to reach
+// for it while debugging exactly the port question this file is about. The port is available in JS
+// without entering wasm at all, from the reservation: see Reachability.port in src/index.ts.
 
-// Reopens the listen sockets. Was a no-op: it re-applied the SAME listen_interfaces string, and
-// apply_settings_pack_impl gates the reopen on setting_changed<std::string>(...) for exactly that
-// setting (session_impl.cpp:1562), which is false when the value is unchanged. So the one thing
-// this function exists to do never happened. reopen_network_sockets calls it directly.
+// Reopens the listen sockets. Note this still does NOT move the listen port, and cannot be used to
+// correct one after the fact. An earlier version re-applied the same listen_interfaces string, which
+// apply_settings_pack_impl gates on setting_changed<std::string>() (session_impl.cpp:1562) and so
+// never reopened anything; calling reopen_network_sockets directly clears that gate but lands on a
+// second one, since partition_listen_sockets matches on original_port, captured BEFORE the bind, so
+// an unchanged interfaces string still leaves every socket matching and nothing is rebuilt.
+// Correcting the port late is not a supported operation, which is why it is reserved up front.
 // Empty flags rather than the default reopen_map_ports: UPnP and NAT-PMP are both off here
 // (settings above), so asking to remap ports would be work with nothing to map.
 LT_API void lt_diag_force_reopen() {

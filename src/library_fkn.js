@@ -130,12 +130,25 @@ addToLibrary({
     // the datagram socket under a udp fd does not survive losing the connection, so the fd keeps its identity and the socket underneath is replaced, re-bound to the same local port
     UDP_REOPEN_DELAYS: [250, 1000, 3000, 10000, 30000],
 
-    attachUdp(st) {
-      const sock = FKN.dgram.createSocket({ type: st.family === 'IPv6' ? 'udp6' : 'udp4' })
+    // `adopt` is a socket the host bound before the session existed, already listening on the port
+    // wrapper.cpp was told to announce. Adopting it rather than binding a fresh one is what keeps
+    // the announced port true: a socket bound after the fact could not get that number back, since
+    // the relay now honours a requested port and would refuse the one we are already holding.
+    attachUdp(st, adopt) {
+      const sock = adopt || FKN.dgram.createSocket({ type: st.family === 'IPv6' ? 'udp6' : 'udp4' })
       st.socket = sock
       st.dead = false
 
+      // Every handler below is guarded on identity, because they close over the STATE and the state
+      // outlives the socket: a reopen or an adoption replaces st.socket while the old socket is
+      // still capable of emitting. Without the guard a discarded socket's 'close' tore down the
+      // live replacement, costing two rounds per reopen. Guarding rather than removing the
+      // listeners is deliberate: an EventEmitter with no 'error' listener THROWS on emit, and
+      // @fkn/lib's dgram emits 'error' from a promise catch at arbitrary later times, so stripping
+      // them converts a harmless stale event into an uncaught throw in the worker.
+      const mine = () => st.socket === sock
       sock.on('message', (data, rinfo) => {
+        if (!mine()) return
         const _t0 = performance.now()
         FKN._dbgWorkerUdpPkts++
         FKN._dbgWorkerUdpBytes += data.length || data.byteLength || 0
@@ -153,18 +166,36 @@ addToLibrary({
         FKN._dbgJsHandlerCalls++
       })
       sock.on('error', (err) => {
+        if (!mine()) return
         st.error = err.errno || FKN.err.IO
         FKN.reopenUdp(st, 'error')
       })
       // a dropped tunnel usually looks like a clean close rather than an error
-      sock.on('close', () => FKN.reopenUdp(st, 'close'))
+      sock.on('close', () => { if (mine()) FKN.reopenUdp(st, 'close') })
       sock.on('listening', () => {
+        if (!mine()) return
         const a = sock.address()
         st.localAddr = a.address; st.localPort = a.port; st.localFamily = a.family
       })
 
+      if (adopt) {
+        // 'listening' fired before this fd existed, so the handler above will never run for it:
+        // read the granted address now or getsockname keeps answering with the requested port.
+        try {
+          const a = sock.address()
+          st.localAddr = a.address; st.localPort = a.port; st.localFamily = a.family
+        } catch (e) {}
+        st.bound = true
+        return sock
+      }
       if (st.bound) {
-        try { sock.bind(st.localPort, st.localAddr) }
+        // Keeping the same port across a reopen is worth one try: peers learned it from the DHT's
+        // implied_port and will keep dialling it. But a named bind is a real bind now that the relay
+        // honours the number, and the socket we just closed may not have released it yet, so after
+        // one refusal take whatever is free. A moved port costs a rebootstrap; no socket costs
+        // everything, and our next datagram teaches storing nodes the new number anyway.
+        const want = (st.reopenAttempts || 0) > 1 ? 0 : st.localPort
+        try { sock.bind(want, st.localAddr) }
         catch (e) { FKN.reopenUdp(st, 'bind') }
       }
       return sock
@@ -182,6 +213,8 @@ addToLibrary({
       setTimeout(() => {
         st.reopening = false
         if (st.closed) return
+        // Close it, but leave its handlers attached: attachUdp's are identity-guarded, so the stale
+        // socket's own events land on a no-op, and removing them would make a later 'error' throw.
         try { st.socket?.close?.() } catch (e) {}
         try {
           FKN.attachUdp(st)
@@ -204,6 +237,9 @@ addToLibrary({
       FKN.net = host.net
       FKN.dgram = host.dgram
       FKN.storage = host.storage || null
+      // { port, server, udp, backlog } from reserveListenPort(), or null when the reservation could
+      // not be made and the engine is running on the placeholder port with ephemeral relay sockets
+      FKN.prebound = host.prebound || null
       FKN.initialized = true
       if (typeof Module === 'object') Module.__FKN = FKN
       FKN._mcInit()
@@ -376,7 +412,24 @@ addToLibrary({
     const ep = FKN.readSockaddr(addrPtr, addrLen)
     if (!ep) return -FKN.err.INVAL
     if (st.kind === 'udp') {
-      st.socket.bind(ep.port, ep.address)
+      const pre = FKN.prebound
+      if (pre && pre.udp && !pre.udpTaken && ep.port === pre.port) {
+        pre.udpTaken = true
+        // The socket made at socket() time was never bound; drop it for the one already holding the
+        // port. attachUdp reassigns st.socket, which is what disarms the discarded socket's own
+        // handlers, so closing it cannot reach back and reopen the socket we just adopted.
+        const stale = st.socket
+        FKN.attachUdp(st, pre.udp)
+        try { if (stale) stale.close() } catch (e) {}
+        return 0
+      }
+      // THE INVARIANT: the shim never names a port to the relay except to reclaim one this same fd
+      // already held (attachUdp's reopen). The relay runs with hostNetwork, so its port space is
+      // shared by every client of a region, and a named bind is now honoured rather than quietly
+      // swapped for an ephemeral one. Naming wrapper.cpp's placeholder makes every client contend
+      // one number; naming the reserved port asks for one our own reservation is holding. Both are
+      // refused, and a refusal here is silent, so ask for 0 and let 'listening' report what landed.
+      st.socket.bind(0, ep.address)
       st.localAddr = ep.address; st.localPort = ep.port; st.localFamily = ep.family
       st.bound = true
       return 0
@@ -399,10 +452,20 @@ addToLibrary({
     if (FKN.debug) console.log('[FKN] listen(fd=' + fd + ')')
     const st = FKN.fds.get(fd)
     if (!st || st.kind !== 'tcp-unbound') return -FKN.err.INVAL
-    const server = FKN.net.createServer()
+    const pre = FKN.prebound
+    const adopt = !!(pre && pre.server && !pre.serverTaken && st.pendingBindPort === pre.port)
+    const server = adopt ? pre.server : FKN.net.createServer()
     st.kind = 'tcp-listen'
     st.server = server
+    // Connections the reserved listener accepted before the session existed. The reservation parks
+    // them rather than dropping them, so a peer that dialled during startup still gets served. The
+    // splice and the flag both run here, synchronously, so no connection can land in between.
     st.acceptQueue = []
+    if (adopt) {
+      pre.serverTaken = true
+      pre.adopted = true
+      st.acceptQueue = pre.backlog.splice(0)
+    }
     server.on('connection', (sock) => {
       st.acceptQueue.push(sock)
       FKN.scheduleTick()
@@ -411,7 +474,18 @@ addToLibrary({
       st.error = err.errno || FKN.err.IO
       FKN.scheduleTick()
     })
-    server.listen(st.pendingBindPort, st.pendingBindAddr)
+    if (adopt) {
+      // Already listening. Calling listen() again would ask the relay for a port this very socket
+      // is holding, which it would refuse, and the granted address is the truth to report onward.
+      try {
+        const a = server.address()
+        if (a) { st.localAddr = a.address; st.localPort = a.port; st.localFamily = a.family }
+      } catch (e) {}
+      if (st.acceptQueue.length) FKN.scheduleTick()
+    } else {
+      // see THE INVARIANT in FKN_bind: a port this fd does not already hold is never named
+      server.listen(0, st.pendingBindAddr)
+    }
     return 0
   },
 
