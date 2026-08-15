@@ -130,6 +130,25 @@ export interface InboundPeer {
  * "is inbound working" was previously unanswerable: the alert stream carried the answer and every
  * caller drained it and threw it away.
  */
+/**
+ * The live state of one socket the engine receives on, read straight off the shim's fd table.
+ *
+ * This is the only part of {@link Reachability} that is not history. Everything else accumulates
+ * from alerts and stays true forever; these fields describe the sockets as they are at the instant
+ * they were read, so a dropped tunnel shows up here and nowhere else.
+ */
+export interface ListenerHealth {
+  transport: 'tcp' | 'udp'
+  /** The port this socket holds right now, or null while nothing is bound. */
+  port: number | null
+  /** Whether it is bound and able to receive. */
+  up: boolean
+  /** Whether a replacement is scheduled, after the socket under it went away. */
+  healing: boolean
+  /** Reopen attempts since the last healthy bind; zero on a socket that has never dropped. */
+  attempts: number
+}
+
 export interface Reachability {
   /** Socket type to the endpoint libtorrent believes it is listening on, e.g. { tcp: "0.0.0.0:6882" }. */
   listening: Record<string, string>
@@ -142,11 +161,27 @@ export interface Reachability {
   /** The most recent inbound connection, or null if nobody has ever dialled in. */
   lastInbound: InboundPeer | null
   /**
-   * The port reserved on the relay and held open for this session, on both TCP and UDP, or null
-   * when no reservation was made. This is the number peers can actually reach, as distinct from
-   * `listening`, which only reports what libtorrent believes.
+   * The port reserved on the relay for this session, on both TCP and UDP, or null when no
+   * reservation was made. This is the number that was announced, as distinct from `listening`,
+   * which only reports what libtorrent believes, and from `listeners`, which reports what is
+   * actually bound. It never changes for the life of the session, because the announce cannot.
    */
   port: number | null
+  /**
+   * Every socket the engine is currently receiving on. Empty when the module exposes no shim, which
+   * is the case for the stub modules the unit tests build sessions from.
+   */
+  listeners: ListenerHealth[]
+  /**
+   * Whether `port` is a number anyone can still reach: some live socket is holding it.
+   *
+   * False covers three different situations that all look the same from outside, and `listeners`
+   * is what separates them: nothing was ever reserved (`port` null), the tunnel under the sockets
+   * dropped and they are healing (`healing` set), or they healed onto a different number after the
+   * relay refused the original (`up` set, `port` mismatched). Only the last is permanent, and none
+   * of the three should be reported to a user as a working inbound port.
+   */
+  portOpen: boolean
 }
 
 // libtorrent/src/alert.cpp:1733, :1290 and :1179. The socket type names are capitalised
@@ -250,7 +285,10 @@ export class Session {
   // the deadlines nothing else is still waiting on
   private deadlineRefs = new Map<number, Map<number, number>>()
 
-  private reachability: Reachability = { listening: {}, listenFailed: [], inbound: 0, inboundByTransport: {}, lastInbound: null, port: null }
+  // `listeners` and `portOpen` are never stored: reachable() derives them from the shim on every
+  // read, because they are the two fields that go stale on their own
+  private reachability: Omit<Reachability, 'listeners' | 'portOpen'> =
+    { listening: {}, listenFailed: [], inbound: 0, inboundByTransport: {}, lastInbound: null, port: null }
 
   constructor(mod: LtModule, options: SessionOptions) {
     this.mod = mod
@@ -788,13 +826,36 @@ export class Session {
    * which is the distinction that decides whether to look at the engine or at the network.
    */
   reachable(): Reachability {
+    const port = this.reachability.port
+    const listeners = this.listeners()
     return {
       listening: { ...this.reachability.listening },
       listenFailed: [...this.reachability.listenFailed],
       inbound: this.reachability.inbound,
       inboundByTransport: { ...this.reachability.inboundByTransport },
       lastInbound: this.reachability.lastInbound,
-      port: this.reachability.port,
+      port,
+      listeners,
+      // One live socket on the announced number is enough. A reservation that got UDP but not TCP is
+      // a supported outcome, and it is most of the value on its own: peers dial uTP first, so inbound
+      // works over the udp socket with no acceptor at all.
+      portOpen: port !== null && listeners.some(l => l.up && l.port === port),
+    }
+  }
+
+  /**
+   * The shim's view of its own sockets, or an empty list when there is no shim to ask.
+   *
+   * Every read goes back to the fd table rather than to anything cached here, because the whole
+   * point of these fields is that they change without an alert: a tunnel drops, `close` fires on a
+   * socket in the shim, and nothing in the alert stream ever mentions it.
+   */
+  private listeners(): ListenerHealth[] {
+    const shim = (this.mod as unknown as { __FKN?: { listeners?: () => ListenerHealth[] } }).__FKN
+    try {
+      return shim?.listeners?.() ?? []
+    } catch {
+      return []
     }
   }
 

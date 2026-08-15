@@ -584,3 +584,140 @@ test('a listener that cannot reclaim its port eventually takes any port', async 
   assert.ok(ephemeral.length >= 1, 'kept asking for a port the relay had already refused; calls=' + JSON.stringify(servers.map(x => x.listenCalls)))
   st.closed = true
 })
+
+// ------------------------------------------------ what is actually bound, right now
+
+/**
+ * The announced port is a promise, and these tests are about keeping it from becoming a lie.
+ *
+ * libtorrent snapshots the number once and cannot be told it moved, so the value a UI shows as
+ * "your inbound port" stays literally correct for the life of the session while quietly ceasing to
+ * be reachable the moment the tunnel under the sockets drops. The acceptor heals itself and the
+ * readout does not, so the display keeps naming a port with confidence after nothing is bound to
+ * it, which is worse than naming none: a user reads it as working.
+ *
+ * FKN.listeners() is the fd table's own answer, taken fresh on every read, and it is the only
+ * thing in the engine that knows.
+ */
+test('a healthy acceptor reports itself as up on the port it holds', () => {
+  const dgram = makeDgram(PORT)
+  const net = makeNet()
+  const pre = prebound(net, dgram)
+  // a real reservation is already listening before the fd exists, which is the whole reason the
+  // adopt path has to take the liveness flag by hand rather than waiting for a 'listening' it
+  // missed
+  pre.server.listen(PORT, '0.0.0.0')
+  const { FKN, library, heap } = loadShim({ net, dgram, storage: null, prebound: pre })
+
+  const udpSt = { kind: 'udp', family: 'IPv4', nonblock: false, socket: dgram.createSocket({ type: 'udp4' }) }
+  const udpFd = FKN.newFd(udpSt)
+  writeSockaddrIn(heap, ADDR_PTR, PORT, '0.0.0.0')
+  assert.equal(library.$FKN_bind(udpFd, ADDR_PTR, 16), 0)
+  listenFd(FKN, library, net)
+
+  const listeners = FKN.listeners()
+  assert.deepEqual(
+    listeners.map((l) => [l.transport, l.port, l.up, l.healing]).sort(),
+    [['tcp', PORT, true, false], ['udp', PORT, true, false]],
+    'the fd table does not report both halves of the reservation as bound',
+  )
+})
+
+test('a dropped acceptor stops reporting itself as up', async () => {
+  const dgram = makeDgram(PORT)
+  const net = makeNet()
+  const { FKN, library } = loadShim({ net, dgram, storage: null })
+  const { st, server } = listenFd(FKN, library, net)
+  st.localPort = PORT
+  st.localAddr = '0.0.0.0'
+  assert.equal(FKN.listeners()[0].up, true)
+
+  server.emit('close')
+  // read INSIDE the backoff window, which is exactly when a stale readout is most convincing: the
+  // acceptor is gone, a replacement has not been made yet, and nothing in the alert stream says so
+  const during = FKN.listeners()[0]
+  assert.equal(during.up, false, 'a closed acceptor still reports itself as bound')
+  assert.equal(during.healing, true, 'a scheduled reopen is not visible')
+  assert.equal(during.attempts, 1)
+
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  const after = FKN.listeners()[0]
+  assert.equal(after.up, true, 'the healed acceptor never came back up')
+  assert.equal(after.healing, false)
+  assert.equal(after.port, PORT, 'the healed acceptor did not reclaim the published port')
+  st.closed = true
+})
+
+/**
+ * The case the whole readout exists for. A relay that refuses the published number heals the
+ * acceptor onto a different one, so the socket is up, the fd is healthy, and the port every
+ * tracker, PEX peer and DHT node was given is now somebody else's. Nothing is in an error state
+ * and nothing will ever recover: the announce cannot be revised.
+ */
+test('an acceptor that healed onto another port reports the port it really holds', async () => {
+  const dgram = makeDgram(PORT)
+  const servers = []
+  // an ephemeral bind draws a NEW number every time, so the healed acceptor genuinely lands
+  // somewhere else; a fake that hands back the same one would pass this test against a readout
+  // that never looked
+  let nextEphemeral = 45678
+  const net = {
+    servers,
+    createServer() {
+      const srv = new EventEmitter()
+      srv.listenCalls = []
+      srv.listen = (port, address) => {
+        srv.listenCalls.push({ port, address })
+        setImmediate(() => {
+          if (port !== 0) srv.emit('error', Object.assign(new Error('Address already in use'), { errno: 29 }))
+          else { srv.granted = nextEphemeral++; srv.emit('listening') }
+        })
+      }
+      srv.close = () => {}
+      srv.address = () => ({ address: '0.0.0.0', port: srv.granted ?? PORT, family: 'IPv4' })
+      servers.push(srv)
+      return srv
+    },
+  }
+  const { FKN, library } = loadShim({ net, dgram, storage: null })
+  const st = { kind: 'tcp-unbound', family: 'IPv4', nonblock: false, pendingBindPort: PORT, pendingBindAddr: '0.0.0.0' }
+  FKN.newFd(st)
+  library.$FKN_listen(FKN.fds.keys().next().value)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(FKN.listeners()[0].port, 45678)
+
+  servers[0].emit('close')
+  await new Promise((resolve) => setTimeout(resolve, 5200))
+
+  const healed = FKN.listeners()[0]
+  assert.equal(healed.up, true, 'never healed at all')
+  assert.notEqual(healed.port, 45678, 'reported the published port after moving off it')
+  st.closed = true
+})
+
+test('a closed listen fd is not reported at all', () => {
+  const dgram = makeDgram(PORT)
+  const net = makeNet()
+  const { FKN, library } = loadShim({ net, dgram, storage: null })
+  const { fd } = listenFd(FKN, library, net)
+  assert.equal(FKN.listeners().length, 1)
+  FKN.closeFd(fd)
+  assert.deepEqual(FKN.listeners(), [], 'a torn-down fd is still being reported as a listener')
+})
+
+/**
+ * An unbound udp fd is not a listener. The shim makes the socket at socket() time and binds it
+ * later, so between the two there is a datagram socket in the table that has never held a port and
+ * cannot receive anything.
+ */
+test('a udp socket that has not bound yet is not reported', () => {
+  const dgram = makeDgram(PORT)
+  const net = makeNet()
+  const { FKN, heap, library } = loadShim({ net, dgram, storage: null })
+  const st = { kind: 'udp', family: 'IPv4', nonblock: false, socket: dgram.createSocket({ type: 'udp4' }) }
+  const fd = FKN.newFd(st)
+  assert.deepEqual(FKN.listeners(), [])
+  writeSockaddrIn(heap, ADDR_PTR, PORT, '0.0.0.0')
+  library.$FKN_bind(fd, ADDR_PTR, 16)
+  assert.equal(FKN.listeners().length, 1)
+})

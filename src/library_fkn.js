@@ -94,6 +94,47 @@ addToLibrary({
 
     storage: null,
 
+    /**
+     * What the engine is holding open RIGHT NOW, one entry per receiving socket.
+     *
+     * The announced port is snapshotted once, at startup, and libtorrent cannot be told it moved
+     * (session_impl.cpp:1790 reads local_endpoint between bind and listen and never refreshes it).
+     * So the number a caller reports as "your inbound port" stays true only for as long as these
+     * sockets keep holding it, and after a dropped tunnel it can be a port nobody is bound to while
+     * still being the number every tracker, PEX peer and DHT node has been given. Both reopens try
+     * to reclaim the same number first for exactly that reason, and after a couple of refusals they
+     * take whatever is free, which heals the socket while leaving the announce wrong.
+     *
+     * Reading this is what lets a caller tell those apart instead of showing a dead port with
+     * confidence. It is a snapshot: nothing here is retained, and the fd table is the only source.
+     */
+    listeners() {
+      const out = []
+      for (const st of FKN.fds.values()) {
+        if (st.closed) continue
+        if (st.kind === 'tcp-listen') {
+          out.push({
+            transport: 'tcp',
+            port: st.localPort ?? null,
+            up: !!st.listening,
+            healing: !!st.listenReopening,
+            attempts: st.listenReopenAttempts || 0,
+          })
+        } else if (st.kind === 'udp' && st.bound) {
+          out.push({
+            transport: 'udp',
+            port: st.localPort ?? null,
+            // a udp socket has no accept step, so `dead` (set by reopenUdp, cleared by attachUdp) is
+            // the whole of its liveness
+            up: !st.dead,
+            healing: !!st.reopening,
+            attempts: st.reopenAttempts || 0,
+          })
+        }
+      }
+      return out
+    },
+
     newFd(state) {
       const fd = FKN.freeFds.length
         ? FKN.freeFds.pop()
@@ -202,13 +243,19 @@ addToLibrary({
       server.on('error', (err) => {
         if (!mine()) return
         st.error = err.errno || FKN.err.IO
+        st.listening = false
         FKN.scheduleTick()
         FKN.reopenListen(st, 'error')
       })
       // a dropped tunnel usually looks like a clean close rather than an error, exactly as for udp
-      server.on('close', () => { if (mine()) FKN.reopenListen(st, 'close') })
+      server.on('close', () => {
+        if (!mine()) return
+        st.listening = false
+        FKN.reopenListen(st, 'close')
+      })
       server.on('listening', () => {
         if (!mine()) return
+        st.listening = true
         // a healed acceptor starts its backoff over, so a later drop is not punished for this one
         st.listenReopenAttempts = 0
         // getsockname answers from here, so it has to name the port that is really held; libtorrent
@@ -237,6 +284,7 @@ addToLibrary({
      */
     reopenListen(st, why) {
       if (st.closed || st.listenReopening || st.kind !== 'tcp-listen') return
+      st.listening = false
       st.listenReopening = true
       const attempt = st.listenReopenAttempts || 0
       st.listenReopenAttempts = attempt + 1
@@ -605,6 +653,9 @@ addToLibrary({
     if (adopt) {
       // Already listening. Calling listen() again would ask the relay for a port this very socket
       // is holding, which it would refuse, and the granted address is the truth to report onward.
+      // 'listening' fired before this fd existed, so wireListener's handler will never run for it
+      // and both the address and the liveness flag have to be taken here.
+      st.listening = true
       try {
         const a = server.address()
         if (a) { st.localAddr = a.address; st.localPort = a.port; st.localFamily = a.family }
