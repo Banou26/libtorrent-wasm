@@ -198,6 +198,98 @@ const REC_TORRENT_READY = 0xf0000001
 const REC_STATE_UPDATE = 0xf0000002
 const REC_READ_PIECE = 0xf0000003
 const REC_RESUME_DATA = 0xf0000004
+const REC_PEERS = 0xf0000005
+const REC_TRACKERS = 0xf0000006
+
+/**
+ * libtorrent's own peer flag bits, from peer_info.hpp:113-213. Named here rather than decoded in
+ * C++ so the wire stays one integer and a flag added later costs nothing on the engine side.
+ */
+export const PEER_FLAG = {
+  interesting: 1 << 0,
+  choked: 1 << 1,
+  remoteInterested: 1 << 2,
+  remoteChoked: 1 << 3,
+  supportsExtensions: 1 << 4,
+  /** We opened the connection. Its absence is what makes a peer an inbound one. */
+  localConnection: 1 << 5,
+  handshake: 1 << 6,
+  connecting: 1 << 7,
+  onParole: 1 << 9,
+  seed: 1 << 10,
+  optimisticUnchoke: 1 << 11,
+  snubbed: 1 << 12,
+  uploadOnly: 1 << 13,
+  endgameMode: 1 << 14,
+  holepunched: 1 << 15,
+  i2pSocket: 1 << 16,
+  utpSocket: 1 << 17,
+  sslSocket: 1 << 18,
+  rc4Encrypted: 1 << 19,
+  plaintextEncrypted: 1 << 20,
+} as const
+
+/** Where we learned about a peer. peer_info.hpp:220-237. */
+export const PEER_SOURCE = {
+  tracker: 1 << 0,
+  dht: 1 << 1,
+  pex: 1 << 2,
+  lsd: 1 << 3,
+  resumeData: 1 << 4,
+  /** The peer dialled us. */
+  incoming: 1 << 5,
+} as const
+
+export interface PeerInfo {
+  /** `address:port`, with an IPv6 address in brackets. */
+  endpoint: string
+  /** Whatever the remote client calls itself. Arbitrary text from the network: never trust it. */
+  client: string
+  /** libtorrent's peer_flags_t. Read it through {@link PEER_FLAG}. */
+  flags: number
+  /** libtorrent's peer_source_flags_t. Read it through {@link PEER_SOURCE}. */
+  source: number
+  /** 0 standard bittorrent, 1 web seed, 2 http seed. */
+  connectionType: number
+  downloadRate: number
+  uploadRate: number
+  payloadDownloadRate: number
+  payloadUploadRate: number
+  totalDownload: number
+  totalUpload: number
+  /** How much of the torrent this peer has, in [0, 1]. */
+  progress: number
+  /** Round trip time in milliseconds, or 0 before it has been measured. */
+  rtt: number
+  /** Pieces this peer has. */
+  numPieces: number
+  /** Blocks we have asked this peer for and not yet received. */
+  requestsInFlight: number
+  /** Failed connection attempts to this peer. */
+  failCount: number
+}
+
+export interface TrackerInfo {
+  url: string
+  /** The tracker's own words when it last said something, or the last transport error. */
+  message: string
+  /** Trackers in tier 0 are tried first; a later tier is only used if the ones before it fail. */
+  tier: number
+  /**
+   * Consecutive failures, or -1 when this tracker has never been contacted at all. The distinction
+   * matters: zero failures on a tracker that has never been tried is not the same as a working one.
+   */
+  fails: number
+  /** An announce is in flight right now. */
+  updating: boolean
+  verified: boolean
+  /** Seconds until the next announce, or -1 when none is scheduled. */
+  nextAnnounceIn: number
+  /** Seeders, leechers and completed downloads from the last scrape; -1 when never scraped. */
+  seeders: number
+  leechers: number
+  downloaded: number
+}
 
 /** libtorrent download priorities. Anything above 7 truncates into a 3-bit field, and 8 would
  *  land as 0, i.e. never download, so stay on these values. */
@@ -267,6 +359,7 @@ const DEFAULT_DEADLINE_STEP_MS = 1000
 
 type PieceWaiter = { handle: number, p0: number, p1: number, settle: (err?: Error) => void }
 type ResumeWaiter = { handle: number, resolve: (data: Uint8Array) => void }
+type ListWaiter<T> = { handle: number, resolve: (list: T[]) => void, timer: ReturnType<typeof setTimeout> }
 
 export class Session {
   private mod: LtModule
@@ -280,6 +373,12 @@ export class Session {
   private pieceWaiters: PieceWaiter[] = []
   private resumeByHandle = new Map<number, Uint8Array>()
   private resumeWaiters: ResumeWaiter[] = []
+  // last answer per torrent, so a caller that polls gets the previous list rather than nothing
+  // while the next post is still in flight
+  private peersByHandle = new Map<number, PeerInfo[]>()
+  private trackersByHandle = new Map<number, TrackerInfo[]>()
+  private peerWaiters: ListWaiter<PeerInfo>[] = []
+  private trackerWaiters: ListWaiter<TrackerInfo>[] = []
   private priosByHandle = new Map<number, Uint8Array>()
   // handle -> piece -> how many in-flight read()s deadlined it, so an abandoned read only retires
   // the deadlines nothing else is still waiting on
@@ -374,6 +473,61 @@ export class Session {
         if (i >= 0) { this.resumeWaiters.splice(i, 1); reject(new Error('save_resume_data timed out')) }
       }, timeoutMs)
     })
+  }
+
+  /**
+   * The peers currently connected for this torrent.
+   *
+   * Asynchronous, and not by preference: `torrent_handle::get_peer_info()` is a sync_call on an
+   * io_context that only runs inside {@link tick}, so reading it from here would block the very
+   * thread that has to tick for it to return. The engine posts the answer onto the alert stream
+   * instead, which means THIS ONLY RESOLVES IF SOMETHING IS PUMPING ALERTS.
+   *
+   * A timeout resolves with the previous answer rather than rejecting, since a stale peer list is
+   * worth more to a caller than an exception, and an empty one is a real answer.
+   */
+  peers(handle: number, timeoutMs = 4000): Promise<PeerInfo[]> {
+    this.mod._lt_torrent_post_peers(handle)
+    return this.awaitList(this.peerWaiters, this.peersByHandle, handle, timeoutMs)
+  }
+
+  /** The last peer list received, without asking for a new one. Empty before the first {@link peers}. */
+  lastPeers(handle: number): PeerInfo[] { return this.peersByHandle.get(handle) ?? [] }
+
+  /** The torrent's trackers and their state. Async for the same reason {@link peers} is. */
+  trackers(handle: number, timeoutMs = 4000): Promise<TrackerInfo[]> {
+    this.mod._lt_torrent_post_trackers(handle)
+    return this.awaitList(this.trackerWaiters, this.trackersByHandle, handle, timeoutMs)
+  }
+
+  /** The last tracker list received, without asking for a new one. */
+  lastTrackers(handle: number): TrackerInfo[] { return this.trackersByHandle.get(handle) ?? [] }
+
+  private awaitList<T>(
+    waiters: ListWaiter<T>[], cache: Map<number, T[]>, handle: number, timeoutMs: number,
+  ): Promise<T[]> {
+    return new Promise<T[]>(resolve => {
+      const waiter: ListWaiter<T> = {
+        handle,
+        resolve,
+        timer: setTimeout(() => {
+          const i = waiters.indexOf(waiter)
+          if (i >= 0) { waiters.splice(i, 1); resolve(cache.get(handle) ?? []) }
+        }, timeoutMs),
+      }
+      waiters.push(waiter)
+    })
+  }
+
+  /** Settle every waiter for this handle, and only for this handle. */
+  private resolveOne<T>(waiters: ListWaiter<T>[], handle: number, list: T[]) {
+    for (let i = waiters.length - 1; i >= 0; i--) {
+      const w = waiters[i]!
+      if (w.handle !== handle) continue
+      clearTimeout(w.timer)
+      waiters.splice(i, 1)
+      w.resolve(list)
+    }
   }
 
   /** The torrent's file layout (path/size/absolute offset) + piece geometry.
@@ -800,6 +954,8 @@ export class Session {
         if (type === REC_TORRENT_READY) this.decodeTorrentReady(view, off)
         else if (type === REC_STATE_UPDATE) this.decodeStateUpdate(view, off)
         else if (type === REC_RESUME_DATA) this.decodeResumeData(view, off, len)
+        else if (type === REC_PEERS) this.decodePeers(view, off)
+        else if (type === REC_TRACKERS) this.decodeTrackers(view, off)
         else if (type === REC_READ_PIECE) { /* fallback path - no MVP consumer */ }
         else {
           const alert = { type, message: m.UTF8ToString(start + off, len) }
@@ -877,6 +1033,74 @@ export class Session {
     if (LISTEN_FAILED_RE.test(message) && this.reachability.listenFailed.length < 32) {
       this.reachability.listenFailed.push(message)
     }
+  }
+
+  /**
+   * A length-prefixed UTF-8 string, as every variable-length field in the record stream is encoded.
+   *
+   * Decoded here rather than through the module's UTF8ToString because that takes a heap pointer
+   * and stops at the first NUL, and none of these strings are terminated. A peer's client name in
+   * particular is arbitrary bytes chosen by a stranger.
+   */
+  private readStr(view: DataView, off: number): [string, number] {
+    const len = view.getUint32(off, true); off += 4
+    const s = utf8.decode(new Uint8Array(view.buffer, view.byteOffset + off, len))
+    return [s, off + len]
+  }
+
+  private decodePeers(view: DataView, off: number) {
+    const handle = view.getUint32(off, true); off += 4
+    const count = view.getUint32(off, true); off += 4
+    const peers: PeerInfo[] = []
+    for (let i = 0; i < count; i++) {
+      let endpoint: string, client: string
+      ;[endpoint, off] = this.readStr(view, off)
+      ;[client, off] = this.readStr(view, off)
+      const flags = view.getUint32(off, true); off += 4
+      const source = view.getUint32(off, true); off += 4
+      const connectionType = view.getUint32(off, true); off += 4
+      const downloadRate = view.getInt32(off, true); off += 4
+      const uploadRate = view.getInt32(off, true); off += 4
+      const payloadDownloadRate = view.getInt32(off, true); off += 4
+      const payloadUploadRate = view.getInt32(off, true); off += 4
+      const totalDownload = Number(view.getBigInt64(off, true)); off += 8
+      const totalUpload = Number(view.getBigInt64(off, true)); off += 8
+      // parts per million on the wire, because an integer crosses the boundary exactly
+      const progress = view.getInt32(off, true) / 1_000_000; off += 4
+      const rtt = view.getInt32(off, true); off += 4
+      const numPieces = view.getInt32(off, true); off += 4
+      const requestsInFlight = view.getInt32(off, true); off += 4
+      const failCount = view.getInt32(off, true); off += 4
+      peers.push({
+        endpoint, client, flags, source, connectionType,
+        downloadRate, uploadRate, payloadDownloadRate, payloadUploadRate,
+        totalDownload, totalUpload, progress, rtt, numPieces, requestsInFlight, failCount,
+      })
+    }
+    this.peersByHandle.set(handle, peers)
+    this.resolveOne(this.peerWaiters, handle, peers)
+  }
+
+  private decodeTrackers(view: DataView, off: number) {
+    const handle = view.getUint32(off, true); off += 4
+    const count = view.getUint32(off, true); off += 4
+    const trackers: TrackerInfo[] = []
+    for (let i = 0; i < count; i++) {
+      let url: string, message: string
+      ;[url, off] = this.readStr(view, off)
+      ;[message, off] = this.readStr(view, off)
+      const tier = view.getInt32(off, true); off += 4
+      const fails = view.getInt32(off, true); off += 4
+      const updating = view.getUint32(off, true) !== 0; off += 4
+      const verified = view.getUint32(off, true) !== 0; off += 4
+      const nextAnnounceIn = view.getInt32(off, true); off += 4
+      const seeders = view.getInt32(off, true); off += 4
+      const leechers = view.getInt32(off, true); off += 4
+      const downloaded = view.getInt32(off, true); off += 4
+      trackers.push({ url, message, tier, fails, updating, verified, nextAnnounceIn, seeders, leechers, downloaded })
+    }
+    this.trackersByHandle.set(handle, trackers)
+    this.resolveOne(this.trackerWaiters, handle, trackers)
   }
 
   private decodeResumeData(view: DataView, off: number, len: number) {

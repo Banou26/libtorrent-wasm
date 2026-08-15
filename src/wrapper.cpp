@@ -1,5 +1,6 @@
 // every C call here is non-blocking: JS drives io_context.poll() via lt_session_tick(), no Asyncify
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -132,6 +133,8 @@ constexpr std::uint32_t REC_TORRENT_READY = 0xF0000001u;
 constexpr std::uint32_t REC_STATE_UPDATE  = 0xF0000002u;
 constexpr std::uint32_t REC_READ_PIECE    = 0xF0000003u;
 constexpr std::uint32_t REC_RESUME_DATA   = 0xF0000004u;
+constexpr std::uint32_t REC_PEERS         = 0xF0000005u;
+constexpr std::uint32_t REC_TRACKERS      = 0xF0000006u;
 
 // info_hashes()/get_best() read m_torrent directly, so unlike the other getters this does not sync_call
 std::uint32_t handle_id_for_hash(lt::sha1_hash const& key) {
@@ -240,6 +243,124 @@ void emit_resume_data(lt::save_resume_data_alert const* a) {
   u32(hid);
   p.insert(p.end(), buf.begin(), buf.end());
   put_record(REC_RESUME_DATA, p);
+}
+
+// endpoint as one length-prefixed string, so v4 and v6 need no separate encoding on the JS side
+std::string endpoint_string(lt::tcp::endpoint const& ep) {
+  // the error_code overload is deprecated and gone in this boost; this one throws only on a
+  // scope-id formatting failure, which cannot happen for an endpoint asio itself produced
+  std::string const addr = ep.address().to_string();
+  return (ep.address().is_v6() ? "[" + addr + "]:" : addr + ":") + std::to_string(ep.port());
+}
+
+/**
+ * The connected peers, as the panel that shows them needs them.
+ *
+ * peer_info carries about sixty fields and almost all of them are for tuning libtorrent rather than
+ * for telling a person what is going on, so this takes the ones a torrent client actually puts on
+ * screen: who, over what, how fast, how much, and how much of the torrent they have.
+ *
+ * `flags` and `source` ship as raw bit fields rather than as decoded booleans. They are libtorrent's
+ * own stable constants, JS names them from the same numbers, and adding a flag later then costs
+ * nothing on this side.
+ */
+void emit_peers(lt::peer_info_alert const* a) {
+  std::uint32_t const hid = handle_id_for_hash(a->handle.info_hashes().get_best());
+  if (hid == 0) return;
+  std::vector<std::uint8_t> p;
+  auto u32 = [&](std::uint32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+  auto i32 = [&](std::int32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+  auto i64 = [&](std::int64_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 8); };
+  auto str = [&](std::string const& s) {
+    u32(static_cast<std::uint32_t>(s.size()));
+    p.insert(p.end(), s.begin(), s.end());
+  };
+  u32(hid);
+  u32(static_cast<std::uint32_t>(a->peer_info.size()));
+  for (auto const& pi : a->peer_info) {
+    str(endpoint_string(pi.ip));
+    // already UTF-8 per peer_info.hpp:84, and arbitrary: it is whatever the remote client called itself
+    str(pi.client);
+    u32(static_cast<std::uint32_t>(pi.flags));
+    u32(static_cast<std::uint32_t>(pi.source));
+    u32(static_cast<std::uint32_t>(pi.connection_type));
+    i32(pi.down_speed);
+    i32(pi.up_speed);
+    i32(pi.payload_down_speed);
+    i32(pi.payload_up_speed);
+    i64(pi.total_download);
+    i64(pi.total_upload);
+    // parts per million, not the float next to it: an integer crosses the boundary exactly
+    i32(pi.progress_ppm);
+    i32(pi.rtt);
+    i32(pi.num_pieces);
+    i32(pi.download_queue_length);
+    i32(pi.failcount);
+  }
+  put_record(REC_PEERS, p);
+}
+
+/**
+ * The trackers, flattened from libtorrent's two-level shape.
+ *
+ * An announce_entry holds one URL and then a list of endpoints under it, one per local interface,
+ * and each endpoint holds its state per info-hash protocol (v1 and v2 announce separately). A user
+ * looking at a tracker list wants one row per tracker, so this collapses that: the row carries the
+ * URL and tier, and the status reported is the healthiest endpoint's, since a tracker reachable
+ * over any interface is a tracker that works.
+ */
+void emit_trackers(lt::tracker_list_alert const* a) {
+  std::uint32_t const hid = handle_id_for_hash(a->handle.info_hashes().get_best());
+  if (hid == 0) return;
+  std::vector<std::uint8_t> p;
+  auto u32 = [&](std::uint32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+  auto i32 = [&](std::int32_t v){ auto* b = reinterpret_cast<std::uint8_t*>(&v); p.insert(p.end(), b, b + 4); };
+  auto str = [&](std::string const& s) {
+    u32(static_cast<std::uint32_t>(s.size()));
+    p.insert(p.end(), s.begin(), s.end());
+  };
+  u32(hid);
+  u32(static_cast<std::uint32_t>(a->trackers.size()));
+  auto const now = lt::clock_type::now();
+  for (auto const& t : a->trackers) {
+    // Best across every endpoint and both protocol versions. `fails` is what decides: zero is
+    // working, and the lowest count is the closest this tracker has come to answering.
+    int best_fails = -1;
+    bool updating = false;
+    bool verified = t.verified;
+    int complete = -1, incomplete = -1, downloaded = -1;
+    std::int32_t next_in = -1;
+    std::string message;
+    for (auto const& ep : t.endpoints) {
+      for (auto const& ih : ep.info_hashes) {
+        if (ih.updating) updating = true;
+        if (best_fails < 0 || ih.fails < best_fails) {
+          best_fails = ih.fails;
+          message = ih.message.empty() && ih.last_error ? ih.last_error.message() : ih.message;
+        }
+        complete = std::max(complete, ih.scrape_complete);
+        incomplete = std::max(incomplete, ih.scrape_incomplete);
+        downloaded = std::max(downloaded, ih.scrape_downloaded);
+        if (ih.next_announce > now) {
+          auto const secs = static_cast<std::int32_t>(
+              std::chrono::duration_cast<std::chrono::seconds>(ih.next_announce - now).count());
+          if (next_in < 0 || secs < next_in) next_in = secs;
+        }
+      }
+    }
+    str(t.url);
+    str(message);
+    i32(t.tier);
+    // -1 when the tracker has never been contacted at all, which is not the same as zero failures
+    i32(best_fails);
+    u32(updating ? 1u : 0u);
+    u32(verified ? 1u : 0u);
+    i32(next_in);
+    i32(complete);
+    i32(incomplete);
+    i32(downloaded);
+  }
+  put_record(REC_TRACKERS, p);
 }
 
 }
@@ -549,6 +670,10 @@ LT_API void lt_session_pump_alerts() {
     if (auto* rpa = lt::alert_cast<lt::read_piece_alert>(a)) { emit_read_piece(rpa); continue; }
     if (auto* srda = lt::alert_cast<lt::save_resume_data_alert>(a)) { emit_resume_data(srda); continue; }
     if (lt::alert_cast<lt::save_resume_data_failed_alert>(a)) { continue; }
+    // both are replies to an explicit post_*, so they arrive only while a caller is asking; their
+    // message() is a bare count and would otherwise flood the text alert stream once per poll
+    if (auto* pia = lt::alert_cast<lt::peer_info_alert>(a)) { emit_peers(pia); continue; }
+    if (auto* tla = lt::alert_cast<lt::tracker_list_alert>(a)) { emit_trackers(tla); continue; }
 
     std::string msg = a->message();
     g_pending_alerts.put_u32(static_cast<std::uint32_t>(a->type()));
@@ -717,6 +842,31 @@ LT_API int lt_torrent_post_status(std::uint32_t id) {
 LT_API int lt_torrent_status(std::uint32_t id, torrent_status_out* out) {
   (void)id; (void)out;
   return -1;
+}
+
+/**
+ * Ask for the peer list. The answer arrives as a REC_PEERS record on the alert stream.
+ *
+ * Async for the same reason status is, and it is not a preference: `h->get_peer_info()` is a
+ * sync_call on an io_context that only runs inside lt_session_tick(), so calling it from JS blocks
+ * the thread that would have to tick for it to return. That deadlock is not hypothetical here,
+ * lt_diag_listen_port() shipped with exactly it and hung forever.
+ */
+LT_API int lt_torrent_post_peers(std::uint32_t id) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  h->post_peer_info();
+  return 0;
+}
+
+// see lt_torrent_post_peers: h->trackers() is a sync_call and would deadlock the same way
+LT_API int lt_torrent_post_trackers(std::uint32_t id) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  h->post_trackers();
+  return 0;
 }
 
 // writes 41 bytes into `out`: 40 hex + NUL
