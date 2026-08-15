@@ -63,10 +63,14 @@ export class Rig {
    * `host` overrides the node net/dgram pair. The default is the plain one; a test that needs to
    * reproduce a host whose sockets behave differently from node's passes its own.
    */
-  constructor({ storageDir, debug = false, enableDht = false, host = null }) {
+  constructor({ storageDir, debug = false, enableDht = false, host = null, rateLimits = null }) {
     this.#storage = new NodeFSStorage(storageDir)
     this.#host = host ?? createNodeHost()
     this.#debug = debug
+    // Session-wide ceilings in bytes per second, handed over BEFORE the session is constructed so
+    // the settings pack carries them from the first byte. A test that wants to change one later
+    // calls session.setRateLimits() instead.
+    this.#rateLimits = rateLimits
     // Off by default here, the opposite of production. A rig that joins the DHT
     // announces its fixture's infohash publicly and gets real peers back for it,
     // so the swarm is not the one the rig defined. Measured: with DHT on, two
@@ -76,6 +80,7 @@ export class Rig {
   }
 
   #debug
+  #rateLimits
 
   get session() { return this.#session }
   get storage() { return this.#storage }
@@ -91,6 +96,7 @@ export class Rig {
       utpReceiveBufferBytes: 4 * 1024 * 1024,
       enableDht: this.#enableDht,
       debug: this.#debug,
+      ...(this.#rateLimits ? { rateLimits: this.#rateLimits } : {}),
     })
     // worker.ts:299 - 30 synchronous ticks before anything is added
     for (let i = 0; i < 30; i++) this.#session.tick()

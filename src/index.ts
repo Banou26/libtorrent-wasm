@@ -37,6 +37,35 @@ export interface SessionOptions {
    * the data, along with their latency and their variance.
    */
   enableDht?: boolean
+  /**
+   * Session-wide transfer ceilings in bytes per second, 0 or absent meaning no ceiling.
+   *
+   * Given here rather than set after construction so a stored preference is in force before the
+   * first torrent is added. {@link Session.setRateLimits} changes them later.
+   */
+  rateLimits?: RateLimits
+}
+
+/** Session-wide transfer ceilings. Every field is optional and an absent one is left unchanged. */
+export interface RateLimits {
+  /** Bytes per second, 0 for unlimited. */
+  download?: number
+  /** Bytes per second, 0 for unlimited. */
+  upload?: number
+  /**
+   * Whether the ceilings reach peers on a private address, defaulting to TRUE, which is the
+   * opposite of libtorrent's own default.
+   *
+   * libtorrent exempts 10/8, 172.16/12, 192.168/16, 127/8, link-local and ::1 from session limits,
+   * on the reasoning that a desktop client has no reason to throttle a machine in the same building.
+   * This engine reaches peers through a relay and has no LAN swarm, so the exemption can only
+   * produce a ceiling that silently does not hold. Measured against a loopback swarm: with
+   * libtorrent's default a 1 MB/s session ceiling transferred at 7.46 MB/s, while a per-torrent
+   * ceiling on the same swarm held, because that one is not routed through the peer class filter.
+   *
+   * Set false to get libtorrent's behaviour back.
+   */
+  limitLocalPeers?: boolean
 }
 
 // torrent_status state_t (TORRENT_ABI_VERSION 3). Only these values occur.
@@ -486,6 +515,14 @@ export class Session {
     if (options.utpReceiveBufferBytes) mod._lt_set_utp_receive_buffer(options.utpReceiveBufferBytes)
     // before _lt_session_create, which is where the settings pack is built
     if (options.enableDht === false) mod._lt_set_dht(0)
+    if (options.rateLimits) {
+      const { download, upload, limitLocalPeers } = options.rateLimits
+      mod._lt_session_set_rate_limits(
+        Math.max(0, Math.floor(download ?? 0)),
+        Math.max(0, Math.floor(upload ?? 0)),
+        limitLocalPeers == null ? -1 : (limitLocalPeers ? 1 : 0),
+      )
+    }
     if (mod._lt_session_create() !== 0) {
       throw new Error('lt_session_create returned non-zero')
     }
@@ -841,6 +878,30 @@ export class Session {
    */
   moveInQueue(handle: number, where: QueueMove) {
     this.mod._lt_torrent_queue_position(handle, QUEUE_MOVE[where])
+  }
+
+  /**
+   * Session-wide transfer ceilings, in bytes per second, 0 for unlimited.
+   *
+   * The whole session's share, enforced through libtorrent's global peer class, so this and a
+   * per-torrent limit compose rather than replace one another: a torrent gets the smaller of the
+   * two, and one torrent alone can use the entire global allowance.
+   *
+   * Every field is optional and an omitted one is left as it was, so one direction can be changed
+   * without having to know the other.
+   *
+   * Write-only, deliberately. `torrent_handle::download_limit()` and `session_handle::get_settings()`
+   * are both sync calls into an io_context that only runs inside {@link Session.tick}, so reading a
+   * limit back from JS would block the thread that has to tick for the answer to arrive. Callers keep
+   * their own record of what they asked for.
+   */
+  setRateLimits({ download, upload, limitLocalPeers }: RateLimits) {
+    const clamp = (value: number | undefined) => (value == null ? -1 : Math.max(0, Math.floor(value)))
+    this.mod._lt_session_set_rate_limits(
+      clamp(download),
+      clamp(upload),
+      limitLocalPeers == null ? -1 : (limitLocalPeers ? 1 : 0),
+    )
   }
 
   /** Bytes per second, or 0 for unlimited. Per torrent, and separate from any relay-side metering. */

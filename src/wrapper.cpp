@@ -431,6 +431,62 @@ LT_API void lt_set_dht(int on) {
   g_dht_enabled = on != 0;
 }
 
+// Session-wide transfer ceilings, in bytes per second, 0 meaning no ceiling. These are the whole
+// session's share rather than one torrent's: libtorrent enforces them through the global peer class,
+// so a per-torrent limit set alongside one of these narrows that torrent further and neither
+// replaces the other.
+//
+// Kept in statics as well as applied, because this is the one setter that is useful on both sides of
+// lt_session_create(). A caller that has a stored preference wants it in force from the first byte,
+// and a caller changing it from a settings screen wants it now; storing and then applying covers
+// both without the caller having to know which situation it is in.
+static std::int32_t g_download_rate_limit = 0;
+static std::int32_t g_upload_rate_limit = 0;
+
+// Whether a ceiling reaches peers on a private address, and it defaults to YES here, which is the
+// OPPOSITE of libtorrent's own default. That inversion is deliberate and it is the difference
+// between the limit working and silently not.
+//
+// libtorrent ships ignore_limits_on_local_network = true (settings_pack.cpp:160) and the session
+// constructor calls init_peer_class_filter(true) (session_impl.cpp:678), which hands 10/8,
+// 172.16/12, 192.168/16, 169.254/16, 127/8, fc00::/7, fe80::/10 and ::1 the LOCAL peer class
+// INSTEAD of the global one. The filter assigns rather than accumulates (ip_filter.cpp:216), so
+// such a peer carries no global class at all and the session ceiling never touches it. That is a
+// sound default for a desktop client on a real LAN, where the point is not to throttle a machine in
+// the same building.
+//
+// It is the wrong default here. This engine reaches its peers through a relay and has no LAN swarm
+// to protect, so the only thing the exemption can produce is a user who asked for 1 MB/s, got a peer
+// on a private address, and is handed an uncapped transfer with nothing on screen to explain it.
+// A ceiling that holds for most peers is a bug, not a feature.
+//
+// It is also what makes the ceiling measurable at all: the test swarm seeds from 127.0.0.x, so with
+// libtorrent's default every rate assertion in tests/rate-limits.test.mjs measures a transfer the
+// limiter was never applied to.
+static bool g_limit_local_peers = true;
+
+// Negative means leave that setting alone, so any one of the three can be changed without having to
+// know the others. Anything else is clamped at 0, which libtorrent reads as unlimited.
+LT_API void lt_session_set_rate_limits(std::int32_t download_bps, std::int32_t upload_bps,
+                                       std::int32_t limit_local_peers) {
+  if (download_bps >= 0) g_download_rate_limit = download_bps;
+  if (upload_bps >= 0) g_upload_rate_limit = upload_bps;
+  if (limit_local_peers >= 0) g_limit_local_peers = limit_local_peers != 0;
+  if (!g_session || !g_session->ses) return;
+  lt::settings_pack sp;
+  sp.set_int(lt::settings_pack::download_rate_limit, g_download_rate_limit);
+  sp.set_int(lt::settings_pack::upload_rate_limit, g_upload_rate_limit);
+  // its update callback re-runs init_peer_class_filter (session_impl.cpp:6815), so unlike most of
+  // the deprecated settings this one really does take effect on a live session
+  sp.set_bool(lt::settings_pack::ignore_limits_on_local_network, !g_limit_local_peers);
+  // safe from JS, unlike the matching getters. apply_settings is an async_call, so it posts the pack
+  // onto the io_context and returns (session_handle.cpp:1001). torrent_handle::download_limit() and
+  // session_handle::get_settings() are sync_call_ret and would block this thread waiting for a
+  // context that only runs inside lt_session_tick(), which is the deadlock lt_diag_listen_port()
+  // shipped with. Nothing here ever reads a limit back out of the engine for that reason.
+  g_session->ses->apply_settings(std::move(sp));
+}
+
 // The port named in listen_interfaces. 6882 is a placeholder, not a real port: the shim's bind is
 // asynchronous, so getsockname answers before the relay has granted anything and :0 reads back as a
 // literal 0, which poisons the tracker announce. A fixed non-zero number was the only way to give
@@ -505,6 +561,11 @@ LT_API int lt_session_create() {
         ? "dht.libtorrent.org:25401,router.bittorrent.com:6881,"
           "router.utorrent.com:6881,dht.transmissionbt.com:6881"
         : "");
+  // whatever lt_session_set_rate_limits() was last told, so a stored preference is in force before
+  // the first torrent is added rather than a tick later
+  sp.set_int(lt::settings_pack::download_rate_limit, g_download_rate_limit);
+  sp.set_int(lt::settings_pack::upload_rate_limit, g_upload_rate_limit);
+  sp.set_bool(lt::settings_pack::ignore_limits_on_local_network, !g_limit_local_peers);
   // pools MUST stay at 0 so nothing tries pthread_create
   sp.set_int(lt::settings_pack::aio_threads, 0);
   sp.set_int(lt::settings_pack::hashing_threads, 0);

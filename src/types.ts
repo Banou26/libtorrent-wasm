@@ -20,6 +20,8 @@ export interface LtModule {
   _lt_alerts_data(): number
   _lt_alerts_clear(): void
 
+  _lt_session_set_rate_limits(downloadBps: number, uploadBps: number, limitLocalPeers: number): void
+
   _lt_session_add_magnet(magnet: number, savePath: number): number
   _lt_session_add_torrent_file(buf: number, len: number, savePath: number): number
   _lt_session_add_torrent_with_resume(buf: number, len: number, savePath: number): number
