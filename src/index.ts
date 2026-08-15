@@ -72,6 +72,15 @@ export interface TorrentStatus {
   autoManaged: boolean
   /** Whether libtorrent's sequential_download flag is currently set on this torrent. */
   sequential: boolean
+  /**
+   * The torrent's whole flag word, as libtorrent's own bits. Read it through {@link TORRENT_FLAG}.
+   *
+   * `paused`, `autoManaged` and `sequential` above are three of these bits decoded for the callers
+   * that already read them; they come from this same value and cannot disagree with it. A UI
+   * drawing a control per flag should read THIS, so that what it shows is the torrent's state
+   * rather than a memory of what it last asked for.
+   */
+  flags: number
   // -1 for a seeding or finished torrent
   /** Position in the download queue, or -1 for a seeding or finished torrent. */
   queuePosition: number
@@ -228,6 +237,51 @@ export const PEER_FLAG = {
   rc4Encrypted: 1 << 19,
   plaintextEncrypted: 1 << 20,
 } as const
+
+/**
+ * libtorrent's per-torrent flags, from torrent_flags.hpp:66-306.
+ *
+ * Only the ones worth acting on from outside the engine are named. The deprecated resume-data bits
+ * (14 to 18) are omitted because they do nothing under this build, and `i2p_torrent` because there
+ * is no i2p here.
+ *
+ * The negative sense of the discovery bits is libtorrent's, not a choice made here: DHT, LSD and
+ * PEX are ON unless the flag is set. A UI showing "find peers with the DHT" is showing the
+ * INVERSE of `disableDht`, and getting that backwards silently turns a privacy control into its
+ * opposite.
+ */
+export const TORRENT_FLAG = {
+  /** Assume every file is already complete and skip hashing. Wrong once and the torrent is a liar. */
+  seedMode: 1 << 0,
+  /** Upload only: keep serving what we have and request nothing. */
+  uploadMode: 1 << 1,
+  shareMode: 1 << 2,
+  applyIpFilter: 1 << 3,
+  paused: 1 << 4,
+  autoManaged: 1 << 5,
+  duplicateIsError: 1 << 6,
+  updateSubscribe: 1 << 7,
+  /** Seed to one peer at a time until the swarm has a full copy. Only meaningful while seeding. */
+  superSeeding: 1 << 8,
+  /** Pieces in file order rather than rarest first, which is what streaming needs. */
+  sequentialDownload: 1 << 9,
+  stopWhenReady: 1 << 10,
+  overrideTrackers: 1 << 11,
+  overrideWebSeeds: 1 << 12,
+  needSaveResume: 1 << 13,
+  /** Set to STOP using the DHT for this torrent. */
+  disableDht: 1 << 19,
+  /** Set to STOP using local peer discovery. Inert here: the session disables LSD outright. */
+  disableLsd: 1 << 20,
+  /** Set to STOP exchanging peers with other peers. */
+  disablePex: 1 << 21,
+  noVerifyFiles: 1 << 22,
+  defaultDontDownload: 1 << 23,
+} as const
+
+/** Where a torrent sits in libtorrent's queue can be moved by one step or to either end. */
+export const QUEUE_MOVE = { top: 0, up: 1, down: 2, bottom: 3 } as const
+export type QueueMove = keyof typeof QUEUE_MOVE
 
 /** Where we learned about a peer. peer_info.hpp:220-237. */
 export const PEER_SOURCE = {
@@ -708,6 +762,59 @@ export class Session {
     this.mod._lt_torrent_set_sequential(handle, on ? 1 : 0)
   }
 
+  /**
+   * Turn torrent flags on and off. `mask` names the bits to touch, `flags` their new value.
+   *
+   * One call rather than a set and an unset, because a status update landing between two calls
+   * would show a combination neither of them asked for. Read the result back from
+   * {@link TorrentStatus.flags} rather than assuming it: the engine refuses some combinations, and
+   * `paused` in particular is also driven by its own auto-management.
+   *
+   * ```ts
+   * // stop using the DHT for this torrent, leave everything else alone
+   * session.setFlags(handle, TORRENT_FLAG.disableDht, TORRENT_FLAG.disableDht)
+   * // and back on
+   * session.setFlags(handle, 0, TORRENT_FLAG.disableDht)
+   * ```
+   */
+  setFlags(handle: number, flags: number, mask: number) {
+    this.mod._lt_torrent_set_flags(handle, flags >>> 0, mask >>> 0)
+  }
+
+  /** Convenience over {@link setFlags} for a single bit. */
+  setFlag(handle: number, flag: number, on: boolean) {
+    this.setFlags(handle, on ? flag : 0, flag)
+  }
+
+  /**
+   * Announce to the trackers now instead of at the next interval.
+   *
+   * libtorrent rate limits this internally, so a caller wiring it to a button cannot turn a user's
+   * impatience into a flood aimed at someone else's tracker.
+   */
+  forceReannounce(handle: number) {
+    this.mod._lt_torrent_force_reannounce(handle)
+  }
+
+  /**
+   * Move a torrent within libtorrent's download queue.
+   *
+   * Only auto-managed torrents have a queue position at all; for anything else
+   * {@link TorrentStatus.queuePosition} is -1 and this does nothing worth showing.
+   */
+  moveInQueue(handle: number, where: QueueMove) {
+    this.mod._lt_torrent_queue_position(handle, QUEUE_MOVE[where])
+  }
+
+  /** Bytes per second, or 0 for unlimited. Per torrent, and separate from any relay-side metering. */
+  setUploadLimit(handle: number, bytesPerSecond: number) {
+    this.mod._lt_torrent_set_upload_limit(handle, Math.max(0, Math.floor(bytesPerSecond)))
+  }
+
+  setDownloadLimit(handle: number, bytesPerSecond: number) {
+    this.mod._lt_torrent_set_download_limit(handle, Math.max(0, Math.floor(bytesPerSecond)))
+  }
+
   setPieceDeadline(handle: number, piece: number, deadlineMs: number, alertWhenAvailable = false) {
     this.mod._lt_torrent_set_piece_deadline(handle, piece, deadlineMs, alertWhenAvailable ? 1 : 0)
   }
@@ -1146,6 +1253,7 @@ export class Session {
     const paused = view.getUint32(off, true) !== 0; off += 4
     const autoManaged = view.getUint32(off, true) !== 0; off += 4
     const sequential = view.getUint32(off, true) !== 0; off += 4
+    const flags = view.getUint32(off, true) >>> 0; off += 4
     const queuePosition = view.getInt32(off, true); off += 4
     const errorCode = view.getInt32(off, true); off += 4
     const errorLen = view.getUint32(off, true); off += 4
@@ -1164,7 +1272,7 @@ export class Session {
     this.statusByHandle.set(handle, {
       state, progress, totalDone, totalWanted, downloadRate, uploadRate,
       numPeers, numSeeds, numPiecesTotal, numPiecesHave, paused,
-      autoManaged, sequential, queuePosition, errorCode, error,
+      autoManaged, sequential, flags, queuePosition, errorCode, error,
       hasMetadata: state !== TORRENT_STATE.downloadingMetadata,
     })
   }

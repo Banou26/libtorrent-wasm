@@ -205,6 +205,11 @@ void emit_state_update(lt::state_update_alert const* sua) {
     u32((st.flags & lt::torrent_flags::auto_managed) ? 1u : 0u);
     // so a streaming caller can confirm set_sequential landed rather than assuming it
     u32((st.flags & lt::torrent_flags::sequential_download) ? 1u : 0u);
+    // The whole flag word, so a UI drawing a checkbox per flag reads the torrent's real state
+    // rather than remembering what it last asked for. The three booleans above are kept because
+    // they already have consumers; they are decoded from this same value in the same statement, so
+    // they cannot disagree with it.
+    u32(static_cast<std::uint32_t>(static_cast<std::uint64_t>(st.flags) & 0xFFFFFFFFull));
     i32(static_cast<std::int32_t>(static_cast<int>(st.queue_position)));
     i32(st.errc ? st.errc.value() : 0);
     std::string const err = st.errc ? st.errc.message() : std::string();
@@ -888,6 +893,78 @@ LT_API int lt_torrent_set_sequential(std::uint32_t id, int on) {
   if (!h || !h->is_valid()) return -1;
   if (on) h->set_flags(lt::torrent_flags::sequential_download);
   else    h->unset_flags(lt::torrent_flags::sequential_download);
+  return 0;
+}
+
+/**
+ * Set and clear torrent flags in one call: `mask` names the bits to touch, `flags` their new value.
+ *
+ * A mask rather than a pair of set/unset calls because these are read-modify-write on a live
+ * torrent, and two calls is two chances for a status update to land in between showing a state
+ * neither call intended.
+ *
+ * 32 bits, not 64. `torrent_flags_t` is a uint64 bitfield and every flag libtorrent defines lives
+ * at bit 24 or below (torrent_flags.hpp:66-306), so a u32 carries all of them and avoids splitting
+ * the value into i32 pairs for a WASM_BIGINT=0 build. If libtorrent ever defines bit 32 this has to
+ * become a pair; the static_assert below is what will say so at compile time rather than in the
+ * field.
+ */
+static_assert(static_cast<std::uint64_t>(lt::torrent_flags::i2p_torrent) < (std::uint64_t{1} << 32),
+    "a torrent flag now lives above bit 31; lt_torrent_set_flags must carry 64 bits");
+
+LT_API int lt_torrent_set_flags(std::uint32_t id, std::uint32_t flags, std::uint32_t mask) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  h->set_flags(lt::torrent_flags_t(static_cast<std::uint64_t>(flags)),
+               lt::torrent_flags_t(static_cast<std::uint64_t>(mask)));
+  return 0;
+}
+
+/**
+ * Announce again now rather than at the next interval.
+ *
+ * `seconds = 0` means immediately. libtorrent rate limits this internally, so a user leaning on the
+ * menu item cannot turn it into a flood aimed at a tracker.
+ */
+LT_API int lt_torrent_force_reannounce(std::uint32_t id) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  h->force_reannounce();
+  return 0;
+}
+
+// 0 top, 1 up, 2 down, 3 bottom. Position is only meaningful for an auto-managed torrent, which is
+// why the caller is expected to hide this when the queue is not what is holding the torrent back.
+LT_API int lt_torrent_queue_position(std::uint32_t id, int where) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  switch (where) {
+    case 0: h->queue_position_top(); break;
+    case 1: h->queue_position_up(); break;
+    case 2: h->queue_position_down(); break;
+    case 3: h->queue_position_bottom(); break;
+    default: return -1;
+  }
+  return 0;
+}
+
+// bytes per second, 0 for unlimited. Per torrent, and independent of the relay's own metering.
+LT_API int lt_torrent_set_upload_limit(std::uint32_t id, std::int32_t bytes_per_second) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  h->set_upload_limit(bytes_per_second);
+  return 0;
+}
+
+LT_API int lt_torrent_set_download_limit(std::uint32_t id, std::int32_t bytes_per_second) {
+  if (!g_session) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  h->set_download_limit(bytes_per_second);
   return 0;
 }
 

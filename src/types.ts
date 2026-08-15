@@ -39,6 +39,11 @@ export interface LtModule {
   _lt_torrent_infohash(handle: number, out: number): number
 
   _lt_torrent_set_sequential(handle: number, on: number): number
+  _lt_torrent_set_flags(handle: number, flags: number, mask: number): number
+  _lt_torrent_force_reannounce(handle: number): number
+  _lt_torrent_queue_position(handle: number, where: number): number
+  _lt_torrent_set_upload_limit(handle: number, bytesPerSecond: number): number
+  _lt_torrent_set_download_limit(handle: number, bytesPerSecond: number): number
   _lt_torrent_read_piece(handle: number, piece: number): number
   _lt_torrent_set_piece_deadline(handle: number, piece: number, deadlineMs: number, alertWhenAvailable: number): number
   _lt_torrent_clear_piece_deadlines(handle: number): number
