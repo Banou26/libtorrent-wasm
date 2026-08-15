@@ -14,6 +14,7 @@
 
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -21,7 +22,7 @@ import test from 'node:test'
 import { TORRENT_FLAG } from '../build/index.js'
 import { Rig } from './rig/harness.mjs'
 import { magnetFor, makeTorrent, writeFixture } from './rig/make-torrent.mjs'
-import { waitFor } from './rig/peer-handshake.mjs'
+import { handshake, waitFor } from './rig/peer-handshake.mjs'
 
 const withTorrent = async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-flags-'))
@@ -31,7 +32,11 @@ const withTorrent = async (t) => {
 
   const rig = new Rig({ storageDir: path.join(root, 'download'), enableDht: false })
   await rig.start()
+  // the peer socket has to close before the rig, or the accepted socket inside the engine holds
+  // node's event loop and the runner reports the file as interrupted
+  const sockets = []
   t.after(async () => {
+    for (const s of sockets) s.destroy()
     await rig.stop()
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -40,7 +45,7 @@ const withTorrent = async (t) => {
   assert.ok(handle >= 0 && handle < 0xFFFFFF00, `add failed, handle ${handle}`)
   rig.startPump([handle])
   await waitFor('the torrent to be registered', () => rig.session.status(handle) != null)
-  return { rig, handle }
+  return { rig, handle, meta, sockets }
 }
 
 /** Flags reach JS through the ordinary status broadcast, so a change needs a pump to become visible. */
@@ -173,4 +178,87 @@ test('an unknown handle is refused rather than crashing the session', async (t) 
   rig.session.moveInQueue(0xDEADBEEF, 'top')
   rig.session.setUploadLimit(0xDEADBEEF, 1024)
   await waitFor('the session to keep reporting', () => rig.session.status(handle) != null)
+})
+
+// ---------------------------------------------------------------- the transfer accounting
+
+/**
+ * The numbers a details pane shows, and the reason they are asserted against a live engine rather
+ * than a hand-built record.
+ *
+ * They ride the state update, which is one long positional byte layout with no field names in it.
+ * Adding a field in wrapper.cpp and decoding it in the wrong place in index.ts produces no error at
+ * the boundary: every field after the mistake is simply read out of the wrong bytes, and the first
+ * symptom is a number that looks slightly wrong on a screen. That happened while writing this
+ * block, and it only surfaced because a later read ran off the end of the buffer and threw.
+ *
+ * So these check plausibility, not equality: that each field decoded as a finite number of the
+ * right sign and rough magnitude, which is what a one-field offset shift destroys.
+ */
+test('the transfer accounting decodes as numbers rather than as shifted bytes', async (t) => {
+  const { rig, handle } = await withTorrent(t)
+  const st = rig.session.status(handle)
+
+  for (const key of [
+    'allTimeDownload', 'allTimeUpload', 'sessionDownload', 'sessionUpload',
+    'sessionPayloadDownload', 'sessionPayloadUpload', 'wasted',
+    'numConnections', 'availability',
+    'activeSeconds', 'seedingSeconds', 'addedAt', 'completedAt', 'lastSeenComplete',
+  ]) {
+    assert.equal(typeof st[key], 'number', `${key} is ${st[key]}`)
+    assert.ok(Number.isFinite(st[key]), `${key} is ${st[key]}`)
+    assert.ok(st[key] >= 0, `${key} is negative: ${st[key]}`)
+  }
+
+  assert.equal(typeof st.hadIncoming, 'boolean')
+  assert.equal(typeof st.savePath, 'string')
+  assert.ok(st.savePath.length > 0, 'the save path came back empty')
+
+  // -1 is libtorrent's "no tracker has answered", and it must survive rather than clamp to 0
+  assert.ok(st.swarmSeeds === -1 || st.swarmSeeds >= 0, `swarmSeeds ${st.swarmSeeds}`)
+  assert.ok(st.swarmPeers === -1 || st.swarmPeers >= 0, `swarmPeers ${st.swarmPeers}`)
+
+  // a fresh torrent with no tracker and no DHT has met nobody
+  assert.equal(st.allTimeDownload, 0)
+  assert.equal(st.allTimeUpload, 0)
+
+  // added_time is a unix SECONDS stamp, so it is around 1.7e9 rather than a millisecond one
+  assert.ok(st.addedAt > 1_600_000_000 && st.addedAt < 4_000_000_000,
+    `addedAt ${st.addedAt} is not a plausible unix seconds stamp`)
+
+  // -1 is libtorrent's "unlimited" rather than a misread, and it must survive as -1 so a UI can
+  // print an infinity sign instead of claiming the cap is minus one connection
+  assert.ok(st.connectionsLimit === -1 || st.connectionsLimit > 0,
+    `connectionsLimit ${st.connectionsLimit}`)
+})
+
+/**
+ * The bytes actually move. A field frozen at zero while the transfer runs is what a decoder reading
+ * the wrong offset looks like once the plausibility checks above pass by luck.
+ */
+test('the counters follow a real transfer', async (t) => {
+  const { rig, meta, handle, sockets } = await withTorrent(t)
+  const port = rig.session.reachable().port
+
+  const socket = net.createConnection({ host: '127.0.0.1', port })
+  sockets.push(socket)
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('no handshake back within 15s')), 15_000)
+    socket.on('connect', () => socket.write(handshake(meta.infoHash, '-qB4650-counters000')))
+    socket.on('data', () => { clearTimeout(timer); resolve() })
+    socket.on('error', (error) => { clearTimeout(timer); reject(error) })
+  })
+
+  // a handshake in and a handshake back is traffic, so the session counters have to have moved
+  await waitFor('the session counters to move', () => {
+    const st = rig.session.status(handle)
+    return st && st.sessionDownload > 0 && st.sessionUpload > 0
+  })
+
+  const st = rig.session.status(handle)
+  assert.ok(st.numConnections >= 1, `numConnections ${st.numConnections}`)
+  // protocol chatter is counted in the totals and not in the payload figures
+  assert.ok(st.sessionDownload >= st.sessionPayloadDownload)
+  assert.ok(st.sessionUpload >= st.sessionPayloadUpload)
+  assert.equal(st.hadIncoming, true, 'a peer dialled in and hadIncoming stayed false')
 })

@@ -210,6 +210,47 @@ void emit_state_update(lt::state_update_alert const* sua) {
     // they already have consumers; they are decoded from this same value in the same statement, so
     // they cannot disagree with it.
     u32(static_cast<std::uint32_t>(static_cast<std::uint64_t>(st.flags) & 0xFFFFFFFFull));
+
+    /**
+     * The accounting a torrent client puts on its details pane.
+     *
+     * `all_time_*` are the ones that answer "how much have I moved for this torrent", across every
+     * session, and they survive a restart only because they ride the resume data. `total_*` are
+     * this session alone, which is why both are sent: a ratio computed from the session figures is
+     * wrong for anything that has ever been restarted.
+     *
+     * `num_complete` and `num_incomplete` are the SWARM's counts from the tracker, as distinct from
+     * `num_seeds`/`num_peers` above, which are what we are connected to. Both are -1 until a
+     * tracker has answered, and -1 has to reach JS intact rather than being clamped to 0.
+     */
+    i64(st.all_time_download);
+    i64(st.all_time_upload);
+    i64(st.total_download);
+    i64(st.total_upload);
+    i64(st.total_payload_download);
+    i64(st.total_payload_upload);
+    // hash failures plus bytes that arrived after we already had them: "wasted" in every client
+    i64(st.total_failed_bytes + st.total_redundant_bytes);
+    i32(st.num_complete);
+    i32(st.num_incomplete);
+    i32(st.num_connections);
+    i32(st.connections_limit);
+    i32(st.num_pieces);
+    // fractional availability: how many complete copies the connected swarm adds up to
+    f32(st.distributed_copies);
+    // seconds, as libtorrent counts them: active includes seeding, seeding is the tail after finishing
+    i32(static_cast<std::int32_t>(st.active_duration.count()));
+    i32(static_cast<std::int32_t>(st.seeding_duration.count()));
+    // unix seconds, 0 when it has not happened
+    i64(static_cast<std::int64_t>(st.added_time));
+    i64(static_cast<std::int64_t>(st.completed_time));
+    i64(static_cast<std::int64_t>(st.last_seen_complete));
+    u32(st.has_incoming ? 1u : 0u);
+    {
+      std::string const sp = st.save_path;
+      u32(static_cast<std::uint32_t>(sp.size()));
+      p.insert(p.end(), sp.begin(), sp.end());
+    }
     i32(static_cast<std::int32_t>(static_cast<int>(st.queue_position)));
     i32(st.errc ? st.errc.value() : 0);
     std::string const err = st.errc ? st.errc.message() : std::string();

@@ -111,6 +111,11 @@ const stateUpdate = ({ handle = 1, numPieces, have = [], sequential = false, sta
   const f32 = (v) => { const b = new DataView(new ArrayBuffer(4)); b.setFloat32(0, v, true); parts.push(new Uint8Array(b.buffer)) }
   u32(handle); i32(state); i64(0); i64(0); f32(0); i32(0); i32(0); i32(0); i32(0)
   u32(0); u32(0); u32(sequential ? 1 : 0); u32(sequential ? 1 << 9 : 0); i32(0); i32(0); u32(0)
+  // the transfer accounting block, all zeroes: nothing here reads it, and the offsets must line up
+  for (let i = 0; i < 7; i++) i64(0)
+  i32(-1); i32(-1); i32(0); i32(0); i32(0); f32(0); i32(0); i32(0)
+  i64(0); i64(0); i64(0); u32(0)
+  u32(0)
   const bytes = new Uint8Array((numPieces + 7) >> 3)
   for (const p of have) bytes[p >> 3] |= 0x80 >> (p & 7)
   u32(numPieces); u32(bytes.length); parts.push(bytes)

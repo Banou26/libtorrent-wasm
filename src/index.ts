@@ -84,6 +84,43 @@ export interface TorrentStatus {
   // -1 for a seeding or finished torrent
   /** Position in the download queue, or -1 for a seeding or finished torrent. */
   queuePosition: number
+  /**
+   * Bytes moved for this torrent across EVERY session, which is what a ratio must be computed
+   * from. It survives a restart only because it rides the resume data, so a torrent re-added
+   * without its resume blob starts from zero, honestly.
+   */
+  allTimeDownload: number
+  allTimeUpload: number
+  /** Bytes moved since this session started, protocol overhead included. */
+  sessionDownload: number
+  sessionUpload: number
+  /** The same, payload only: the difference from the pair above is protocol chatter. */
+  sessionPayloadDownload: number
+  sessionPayloadUpload: number
+  /** Bytes that arrived and could not be used: failed hash checks plus data we already had. */
+  wasted: number
+  /** Seeders and leechers in the whole SWARM per the tracker, or -1 before one has answered. */
+  swarmSeeds: number
+  swarmPeers: number
+  /** Open connections, and the cap this session allows. */
+  numConnections: number
+  connectionsLimit: number
+  /**
+   * How many complete copies the peers we can see add up to, fractionally. Below 1 means no
+   * combination of the peers currently reachable holds the whole torrent.
+   */
+  availability: number
+  /** Seconds this torrent has been running, and of those, seconds spent seeding. */
+  activeSeconds: number
+  seedingSeconds: number
+  /** Unix seconds, or 0 for something that has not happened. */
+  addedAt: number
+  completedAt: number
+  lastSeenComplete: number
+  /** Whether anyone has ever dialled IN to this torrent. */
+  hadIncoming: boolean
+  /** Where the engine is writing it. */
+  savePath: string
   /** libtorrent's error_code value for this torrent, 0 when it has no error. */
   errorCode: number
   /** The matching message, empty when there is no error. */
@@ -1254,6 +1291,34 @@ export class Session {
     const autoManaged = view.getUint32(off, true) !== 0; off += 4
     const sequential = view.getUint32(off, true) !== 0; off += 4
     const flags = view.getUint32(off, true) >>> 0; off += 4
+    // wrapper.cpp appends this block straight after the flag word, BEFORE the queue position:
+    // the two orders have to match statement for statement or every field after the first
+    // mismatch is read out of the wrong bytes
+    const allTimeDownload = Number(view.getBigInt64(off, true)); off += 8
+    const allTimeUpload = Number(view.getBigInt64(off, true)); off += 8
+    const sessionDownload = Number(view.getBigInt64(off, true)); off += 8
+    const sessionUpload = Number(view.getBigInt64(off, true)); off += 8
+    const sessionPayloadDownload = Number(view.getBigInt64(off, true)); off += 8
+    const sessionPayloadUpload = Number(view.getBigInt64(off, true)); off += 8
+    const wasted = Number(view.getBigInt64(off, true)); off += 8
+    // -1 until a tracker answers, and that has to survive rather than being clamped to 0
+    const swarmSeeds = view.getInt32(off, true); off += 4
+    const swarmPeers = view.getInt32(off, true); off += 4
+    const numConnections = view.getInt32(off, true); off += 4
+    const connectionsLimit = view.getInt32(off, true); off += 4
+    // st.num_pieces, which is the have-count libtorrent already tracks. Skipped rather than used:
+    // numPiecesHave below is counted off the bitfield, and two sources for one number is how they
+    // start disagreeing.
+    off += 4
+    const availability = view.getFloat32(off, true); off += 4
+    const activeSeconds = view.getInt32(off, true); off += 4
+    const seedingSeconds = view.getInt32(off, true); off += 4
+    const addedAt = Number(view.getBigInt64(off, true)); off += 8
+    const completedAt = Number(view.getBigInt64(off, true)); off += 8
+    const lastSeenComplete = Number(view.getBigInt64(off, true)); off += 8
+    const hadIncoming = view.getUint32(off, true) !== 0; off += 4
+    let savePath: string
+    ;[savePath, off] = this.readStr(view, off)
     const queuePosition = view.getInt32(off, true); off += 4
     const errorCode = view.getInt32(off, true); off += 4
     const errorLen = view.getUint32(off, true); off += 4
@@ -1273,6 +1338,11 @@ export class Session {
       state, progress, totalDone, totalWanted, downloadRate, uploadRate,
       numPeers, numSeeds, numPiecesTotal, numPiecesHave, paused,
       autoManaged, sequential, flags, queuePosition, errorCode, error,
+      allTimeDownload, allTimeUpload, sessionDownload, sessionUpload,
+      sessionPayloadDownload, sessionPayloadUpload, wasted,
+      swarmSeeds, swarmPeers, numConnections, connectionsLimit, availability,
+      activeSeconds, seedingSeconds, addedAt, completedAt, lastSeenComplete,
+      hadIncoming, savePath,
       hasMetadata: state !== TORRENT_STATE.downloadingMetadata,
     })
   }
