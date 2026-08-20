@@ -1,0 +1,57 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Every run compiles the engine from source before a single test can import it: the emsdk
+    # image, boost 1.84 headers, then ~160 translation units. 46s on a 16 core desktop.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `make dist` applies patches/*.patch onto the libtorrent submodule, so it has to be here.
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+        env:
+          # tests/ is node --test over loopback sockets and the wasm engine, never a browser.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+      # `docker compose run` would build this on demand; doing it here keeps the image build
+      # (emsdk + boost headers staged into the sysroot) out of the compile step's log.
+      - run: docker compose build libtorrent-wasm
+
+      # dist/ and build/ are gitignored, so the engine every test imports has to be produced here.
+      - name: Compile the wasm engine
+        run: npm run make-docker 2>&1 | tee wasm-build.log
+
+      # The docker wrapper exits 0 even when ninja stops, so the log is the result and the exit
+      # code is not. Match `error:` with its colon: bare `error` hits the error_code.cpp.o line.
+      - name: Read the build log for failures
+        run: |
+          failures=$(grep -oE 'FAILED:|ninja: build stopped|CMake Error|error:|Error [0-9]+' wasm-build.log | wc -l)
+          echo "failure lines in log: $failures"
+          test "$failures" -eq 0
+          # A link that emitted nothing usable leaves every step above still looking healthy.
+          test -s dist/libtorrent.wasm
+          grep -q _lt_session_create dist/libtorrent.js
+
+      # `npm run build` minus the compile above, split so each step's own exit code gates the run
+      # (chained behind a pipe, a tsc failure would be swallowed).
+      - run: npm run vite-build
+      - run: npm run types
+      # Puts dist/libtorrent.{js,wasm} beside the bundle, where build/index.js imports them.
+      - run: npm run copy-wasm
+
+      - run: npm test
