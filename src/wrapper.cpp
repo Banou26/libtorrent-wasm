@@ -976,15 +976,49 @@ LT_API int lt_torrent_post_trackers(std::uint32_t id) {
   return 0;
 }
 
-// writes 41 bytes into `out`: 40 hex + NUL
+/**
+ * The torrent's identity, as hex. WRITES UP TO 65 BYTES into `out`: 64 hex + NUL.
+ *
+ * Two things were wrong here and each on its own was fatal.
+ *
+ * It took `ih.v2` whenever there was one, then cut the result to 40 characters with `out[40] = 0`.
+ * That yielded the first 20 bytes of a SHA-256 formatted exactly like a v1 infohash: a string that
+ * names no torrent, that the caller then used as the torrent's identity everywhere, and that went
+ * into a `magnet:?xt=urn:btih:` link no client can resolve.
+ *
+ * And `to_hex` writes `size * 2` characters PLUS a NUL at `out[size * 2]`, so a 32-byte hash writes
+ * 65 bytes into what callers allocated as 41: twenty-four bytes past the end of the allocation, on
+ * every call for a torrent with a v2 hash.
+ *
+ * V1 WINS WHEREVER THERE IS ONE. A hybrid torrent has both hashes and is one torrent, so which one
+ * comes back cannot depend on the caller. The v1 hash is the one every client understands and the
+ * one the caller's own metainfo decoder computes, so returning it keeps the two paths agreeing about
+ * which torrent this is. A v2-only torrent answers with 64 characters.
+ */
 LT_API int lt_torrent_infohash(std::uint32_t id, char* out) {
   if (!g_session || !out) return -1;
   auto* h = lookup_handle(id);
   if (!h || !h->is_valid()) return -1;
   auto ih = h->info_hashes();
-  auto hash = ih.has_v2() ? ih.v2.to_string() : ih.v1.to_string();
-  lt::aux::to_hex(hash, out);
-  out[40] = '\0';
+  // to_hex NUL-terminates at the real width, so nothing here truncates
+  lt::aux::to_hex(ih.has_v1() ? ih.v1.to_string() : ih.v2.to_string(), out);
+  return 0;
+}
+
+/**
+ * The v2 hash on its own, 64 hex + NUL, or -1 when this torrent has none.
+ *
+ * Separate from the call above rather than folded into it, because a hybrid has to be able to answer
+ * BOTH: the v1 hash is its identity and the v2 hash still belongs in its magnet, so a v2-aware
+ * client can reach the same swarm.
+ */
+LT_API int lt_torrent_infohash_v2(std::uint32_t id, char* out) {
+  if (!g_session || !out) return -1;
+  auto* h = lookup_handle(id);
+  if (!h || !h->is_valid()) return -1;
+  auto ih = h->info_hashes();
+  if (!ih.has_v2()) return -1;
+  lt::aux::to_hex(ih.v2.to_string(), out);
   return 0;
 }
 

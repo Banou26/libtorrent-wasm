@@ -1074,11 +1074,27 @@ export class Session {
     this.mod._lt_torrent_post_status(handle)
   }
 
+  /**
+   * The torrent's identity as hex: 40 characters for v1 or a hybrid, 64 for a v2-only torrent.
+   *
+   * SIXTY-FIVE BYTES, not 41. `to_hex` writes twice the hash length plus a NUL, so a 32-byte v2 hash
+   * needs 65, and the 41 this used to allocate was overrun by 24 bytes on every call for a torrent
+   * carrying a v2 hash.
+   */
   infohash(handle: number): string | null {
+    return this.readHash(handle, this.mod._lt_torrent_infohash)
+  }
+
+  /** The v2 hash, for a hybrid or v2 torrent. Null for a v1-only one, which has none. */
+  infohashV2(handle: number): string | null {
+    return this.readHash(handle, this.mod._lt_torrent_infohash_v2)
+  }
+
+  private readHash(handle: number, read: (handle: number, out: number) => number): string | null {
     const m = this.mod
-    const ptr = m._malloc(41)
+    const ptr = m._malloc(65)
     try {
-      if (m._lt_torrent_infohash(handle, ptr) !== 0) return null
+      if (read.call(m, handle, ptr) !== 0) return null
       return m.UTF8ToString(ptr)
     } finally {
       m._free(ptr)
