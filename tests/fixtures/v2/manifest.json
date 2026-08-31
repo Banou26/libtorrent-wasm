@@ -1,0 +1,688 @@
+[
+  {
+    "case": "pow2-pieces",
+    "why": "baseline: short file, sub-piece file, exact piece, multi-piece, empty file, unaligned tail",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "a-small.bin"
+            ],
+            "size": 1000,
+            "seed": "pow2-pieces/a-small.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "b-block-and-a-bit.bin"
+            ],
+            "size": 20000,
+            "seed": "pow2-pieces/b-block-and-a-bit.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "e-empty.bin"
+            ],
+            "size": 0,
+            "seed": "pow2-pieces/e-empty.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "nested",
+              "c-exact-piece.bin"
+            ],
+            "size": 65536,
+            "seed": "pow2-pieces/nested/c-exact-piece.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "nested",
+              "d-many-pieces.bin"
+            ],
+            "size": 208953,
+            "seed": "pow2-pieces/nested/d-many-pieces.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "z-tail.bin"
+            ],
+            "size": 5000,
+            "seed": "pow2-pieces/z-tail.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "a-small.bin"
+            ],
+            "size": 1000,
+            "seed": "pow2-pieces/a-small.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "b-block-and-a-bit.bin"
+            ],
+            "size": 20000,
+            "seed": "pow2-pieces/b-block-and-a-bit.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "e-empty.bin"
+            ],
+            "size": 0,
+            "seed": "pow2-pieces/e-empty.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "nested",
+              "c-exact-piece.bin"
+            ],
+            "size": 65536,
+            "seed": "pow2-pieces/nested/c-exact-piece.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "nested",
+              "d-many-pieces.bin"
+            ],
+            "size": 208953,
+            "seed": "pow2-pieces/nested/d-many-pieces.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "z-tail.bin"
+            ],
+            "size": 5000,
+            "seed": "pow2-pieces/z-tail.bin"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "odd-piece-counts",
+    "why": "THE PIECE-LEVEL PAD HASH. Every file here has a non-power-of-two piece count",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "five-pieces.bin"
+            ],
+            "size": 262151,
+            "seed": "odd-piece-counts/five-pieces.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "seven-pieces.bin"
+            ],
+            "size": 458751,
+            "seed": "odd-piece-counts/seven-pieces.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "three-pieces.bin"
+            ],
+            "size": 131073,
+            "seed": "odd-piece-counts/three-pieces.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "five-pieces.bin"
+            ],
+            "size": 262151,
+            "seed": "odd-piece-counts/five-pieces.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "seven-pieces.bin"
+            ],
+            "size": 458751,
+            "seed": "odd-piece-counts/seven-pieces.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "three-pieces.bin"
+            ],
+            "size": 131073,
+            "seed": "odd-piece-counts/three-pieces.bin"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "min-piece-length",
+    "why": "blocksPerPiece is 1, so the piece layer IS the leaf layer and the pad hash degenerates",
+    "pieceLength": 16384,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "a.bin"
+            ],
+            "size": 1000,
+            "seed": "min-piece-length/a.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "b.bin"
+            ],
+            "size": 81923,
+            "seed": "min-piece-length/b.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "a.bin"
+            ],
+            "size": 1000,
+            "seed": "min-piece-length/a.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "b.bin"
+            ],
+            "size": 81923,
+            "seed": "min-piece-length/b.bin"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "big-piece-length",
+    "why": "blocksPerPiece is 64, so the leaf-vs-piece padding rules differ the most",
+    "pieceLength": 1048576,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "big.bin"
+            ],
+            "size": 2097157,
+            "seed": "big-piece-length/big.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "mid.bin"
+            ],
+            "size": 307200,
+            "seed": "big-piece-length/mid.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "small.bin"
+            ],
+            "size": 100,
+            "seed": "big-piece-length/small.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "big.bin"
+            ],
+            "size": 2097157,
+            "seed": "big-piece-length/big.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "mid.bin"
+            ],
+            "size": 307200,
+            "seed": "big-piece-length/mid.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "small.bin"
+            ],
+            "size": 100,
+            "seed": "big-piece-length/small.bin"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "sort-order",
+    "why": "FILE ORDER: names where a naive joined-path sort gives a different answer",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "B.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/B.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "a",
+              "a.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/a/a.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "a",
+              "b.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/a/b.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "a!.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/a!.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "a.b.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/a.b.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "B.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/B.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "a",
+              "a.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/a/a.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "a",
+              "b.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/a/b.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "a!.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/a!.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "a.b.bin"
+            ],
+            "size": 100,
+            "seed": "sort-order/a.b.bin"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "single-file",
+    "why": "a picked FILE rather than a folder: no `files` list, and pads around a single file",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "movie.mkv",
+        "files": [
+          {
+            "path": [
+              "movie.mkv"
+            ],
+            "size": 132071,
+            "seed": "single-file/movie.mkv"
+          }
+        ]
+      },
+      "v2": {
+        "name": "movie.mkv",
+        "files": [
+          {
+            "path": [
+              "movie.mkv"
+            ],
+            "size": 132071,
+            "seed": "single-file/movie.mkv"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "single-file-exact",
+    "why": "single file landing exactly on a piece boundary: no trailing pad at all",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "exact.bin",
+        "files": [
+          {
+            "path": [
+              "exact.bin"
+            ],
+            "size": 65536,
+            "seed": "single-file-exact/exact.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "exact.bin",
+        "files": [
+          {
+            "path": [
+              "exact.bin"
+            ],
+            "size": 65536,
+            "seed": "single-file-exact/exact.bin"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "folder-one-file",
+    "why": "ONE file in a FOLDER, ending unaligned: libtorrent emits NO pad, because the rule counts files",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "only.mkv"
+            ],
+            "size": 100000,
+            "seed": "folder-one-file/only.mkv"
+          }
+        ]
+      },
+      "v2": {
+        "name": "only.mkv",
+        "files": [
+          {
+            "path": [
+              "only.mkv"
+            ],
+            "size": 100000,
+            "seed": "folder-one-file/only.mkv"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "one-file-plus-empty",
+    "why": "the same file plus an empty one, so the count passes 1 and the pad DOES appear",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "a.mkv"
+            ],
+            "size": 100000,
+            "seed": "one-file-plus-empty/a.mkv"
+          },
+          {
+            "path": [
+              "Pack",
+              "z-empty.bin"
+            ],
+            "size": 0,
+            "seed": "one-file-plus-empty/z-empty.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "a.mkv"
+            ],
+            "size": 100000,
+            "seed": "one-file-plus-empty/a.mkv"
+          },
+          {
+            "path": [
+              "Pack",
+              "z-empty.bin"
+            ],
+            "size": 0,
+            "seed": "one-file-plus-empty/z-empty.bin"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "empty-first",
+    "why": "an empty file FIRST: no pad after it, and the tail pad still lands after the real one",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "a-empty.bin"
+            ],
+            "size": 0,
+            "seed": "empty-first/a-empty.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "z.mkv"
+            ],
+            "size": 100000,
+            "seed": "empty-first/z.mkv"
+          }
+        ]
+      },
+      "v2": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "a-empty.bin"
+            ],
+            "size": 0,
+            "seed": "empty-first/a-empty.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "z.mkv"
+            ],
+            "size": 100000,
+            "seed": "empty-first/z.mkv"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "one-byte",
+    "why": "a single byte: one leaf, one piece, one sha1",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "tiny.bin"
+            ],
+            "size": 1,
+            "seed": "one-byte/tiny.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "tiny.bin",
+        "files": [
+          {
+            "path": [
+              "tiny.bin"
+            ],
+            "size": 1,
+            "seed": "one-byte/tiny.bin"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "case": "exact-block",
+    "why": "LEAF-LEVEL padding: file under one piece with a non-power-of-two leaf count",
+    "pieceLength": 65536,
+    "kinds": {
+      "hybrid": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "block.bin"
+            ],
+            "size": 16384,
+            "seed": "exact-block/block.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "three-blocks.bin"
+            ],
+            "size": 49152,
+            "seed": "exact-block/three-blocks.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "two-blocks.bin"
+            ],
+            "size": 32768,
+            "seed": "exact-block/two-blocks.bin"
+          }
+        ]
+      },
+      "v2": {
+        "name": "Pack",
+        "files": [
+          {
+            "path": [
+              "Pack",
+              "block.bin"
+            ],
+            "size": 16384,
+            "seed": "exact-block/block.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "three-blocks.bin"
+            ],
+            "size": 49152,
+            "seed": "exact-block/three-blocks.bin"
+          },
+          {
+            "path": [
+              "Pack",
+              "two-blocks.bin"
+            ],
+            "size": 32768,
+            "seed": "exact-block/two-blocks.bin"
+          }
+        ]
+      }
+    }
+  }
+]
