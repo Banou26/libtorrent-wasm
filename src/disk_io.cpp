@@ -2,8 +2,10 @@
 
 #include "disk_io.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -181,26 +183,68 @@ struct wasm_disk_io final
       return;
     }
     if (slices.size() == 1) {
+      auto const& s = slices.front();
+      if (se->fs->pad_file_at(s.file_index)) {
+        auto const size = static_cast<std::int32_t>(s.size);
+        auto* zeros = static_cast<std::uint8_t*>(std::calloc(std::max<std::size_t>(1, std::size_t(size)), 1));
+        post(m_ios, [this, handler = std::move(handler), zeros, size] {
+          handler(disk_buffer_holder(*this, reinterpret_cast<char*>(zeros), size), storage_error{});
+        });
+        return;
+      }
       auto const job_id = next_job_id();
       {
         std::lock_guard<std::mutex> g(m_mu);
         m_pending.emplace(job_id, read_job{std::move(handler)});
       }
-      auto const& s = slices.front();
       js_disk_read(static_cast<int>(idx), job_id, static_cast<int>(s.file_index),
                    s.offset, static_cast<std::int32_t>(s.size));
       return;
     }
     auto* combined = static_cast<std::uint8_t*>(std::malloc(r.length));
-    auto remaining = std::make_shared<std::atomic<int>>(static_cast<int>(slices.size()));
+    // pad slices never reach JS, so `remaining` counts only the reads that were actually issued
+    int real_slices = 0;
+    for (auto const& s : slices) if (!se->fs->pad_file_at(s.file_index)) ++real_slices;
+    if (real_slices == 0) {
+      std::memset(combined, 0, std::size_t(r.length));
+      post(m_ios, [this, handler = std::move(handler), combined, len = r.length] {
+        handler(disk_buffer_holder(*this, reinterpret_cast<char*>(combined), len), storage_error{});
+      });
+      return;
+    }
+    auto remaining = std::make_shared<std::atomic<int>>(real_slices);
     auto first_err = std::make_shared<std::atomic<int>>(0);
+    /*
+     * ONE handler, shared, never a copy per slice. This is a memory-safety requirement rather than
+     * a saving, and `async_write` below has always done it this way.
+     *
+     * Capturing `handler` by value gives every sub-handler its own COPY of the caller's callable,
+     * and the original is destroyed when this function returns. libtorrent's checking code hands
+     * `async_hash` a span pointing INTO a vector that the callable owns (torrent.cpp: `hashes1 =
+     * std::move(hashes)` beside `span<sha256_hash> v2_span(hashes)`), so copying the callable
+     * duplicates the vector and frees the buffer the span still points at. The read then completes
+     * and writes its v2 block hashes through that span, into freed memory.
+     *
+     * It was latent for four years because only a v2 or hybrid torrent passes a non-empty span, and
+     * only a piece that STRADDLES a file boundary takes this multi-slice path. A hybrid pads every
+     * file up to a piece boundary, so it straddles constantly and dies on the first such piece.
+     * AddressSanitizer named it: heap-use-after-free, WRITE of size 32, on a 32-byte region
+     * allocated by `vector<digest32<256>>::__append` inside `torrent::start_checking`.
+     */
+    auto shared_handler = std::make_shared<std::function<void(disk_buffer_holder, storage_error const&)>>(
+        std::move(handler));
     std::int64_t byte_off = 0;
     for (auto const& s : slices) {
+      if (se->fs->pad_file_at(s.file_index)) {
+        std::memset(combined + byte_off, 0, std::size_t(s.size));
+        byte_off += s.size;
+        continue;
+      }
       auto const sub_id = next_job_id();
       auto const this_off = byte_off;
       auto const this_size = static_cast<std::int32_t>(s.size);
       auto sub_handler = [this, combined, remaining, first_err, this_off, this_size,
-                          total_len = r.length, handler]
+                          total_len = r.length, shared_handler]
                          (disk_buffer_holder data, storage_error const& ec) mutable
       {
         if (ec && first_err->load() == 0) first_err->store(ec.ec.value());
@@ -209,12 +253,12 @@ struct wasm_disk_io final
         int err = first_err->load();
         if (err != 0) {
           std::free(combined);
-          handler(disk_buffer_holder{}, storage_error{
+          (*shared_handler)(disk_buffer_holder{}, storage_error{
               error_code(err, system_category()), operation_t::file_read});
           return;
         }
         disk_buffer_holder holder(*this, reinterpret_cast<char*>(combined), total_len);
-        handler(std::move(holder), storage_error{});
+        (*shared_handler)(std::move(holder), storage_error{});
       };
       {
         std::lock_guard<std::mutex> g(m_mu);
@@ -250,23 +294,35 @@ struct wasm_disk_io final
       return false;
     }
     if (slices.size() == 1) {
+      auto const& s = slices.front();
+      // a write to a pad file is a no-op: those bytes are zeroes by definition and are stored nowhere
+      if (se->fs->pad_file_at(s.file_index)) {
+        post(m_ios, [handler = std::move(handler)] { handler(storage_error{}); });
+        return false;
+      }
       auto const job_id = next_job_id();
       {
         std::lock_guard<std::mutex> g(m_mu);
         m_pending.emplace(job_id, write_job{std::move(handler), std::move(obs)});
       }
-      auto const& s = slices.front();
       js_disk_write(static_cast<int>(idx), job_id, static_cast<int>(s.file_index),
                     s.offset, reinterpret_cast<std::uint8_t const*>(buf),
                     static_cast<std::int32_t>(s.size));
       return false;
     }
-    auto remaining = std::make_shared<std::atomic<int>>(static_cast<int>(slices.size()));
+    int real_slices = 0;
+    for (auto const& s : slices) if (!se->fs->pad_file_at(s.file_index)) ++real_slices;
+    if (real_slices == 0) {
+      post(m_ios, [handler = std::move(handler)] { handler(storage_error{}); });
+      return false;
+    }
+    auto remaining = std::make_shared<std::atomic<int>>(real_slices);
     auto first_err = std::make_shared<std::atomic<int>>(0);
     auto shared_obs = std::shared_ptr<disk_observer>(std::move(obs));
     auto shared_handler = std::make_shared<std::function<void(storage_error const&)>>(std::move(handler));
     std::int64_t byte_off = 0;
     for (auto const& s : slices) {
+      if (se->fs->pad_file_at(s.file_index)) { byte_off += s.size; continue; }
       auto const sub_id = next_job_id();
       auto const this_off = byte_off;
       auto sub_handler = [remaining, first_err, shared_handler]
@@ -304,14 +360,40 @@ struct wasm_disk_io final
       });
       return;
     }
+    /*
+     * THE V1 AND V2 PIECE SIZES ARE NOT THE SAME NUMBER, and this used to use the v1 one for both.
+     *
+     * `piece_size` is the whole piece, pad bytes included. `piece_size2` is the piece CLAMPED to the
+     * end of the file it belongs to, which is what a v2 leaf covers: a v2 hash is over one file's
+     * bytes and stops where the file stops. Hashing the padded length instead absorbs the pad
+     * zeroes into the last leaf of every file that does not end on a 16 KiB boundary, and produces
+     * one leaf too many.
+     *
+     * The result is a torrent whose v1 half verifies and whose v2 half does not, which libtorrent
+     * routes to `handle_inconsistent_hashes`: the whole have-set is dropped and the torrent pauses
+     * with `torrent_inconsistent_hashes`. Since a pad follows nearly every file, that is nearly
+     * every v2 or hybrid torrent, on the first piece that ends a file.
+     *
+     * Sizes follow mmap_disk_io::do_hash, which is the reference implementation.
+     */
+    bool const want_v1 = bool(flags & disk_interface::v1_hash);
+    bool const want_v2 = !v2.empty();
     int const piece_size = se->fs->piece_size(piece);
-    auto buf = std::make_shared<std::vector<char>>(piece_size);
+    int const piece_size2 = want_v2 ? se->fs->piece_size2(piece) : 0;
+    // piece_size2 never exceeds piece_size, so the v1 read covers the v2 blocks as a prefix
+    int const read_size = want_v1 ? piece_size : piece_size2;
+    if (read_size <= 0) {
+      post(m_ios, [handler = std::move(handler), piece] { handler(piece, sha1_hash{}, storage_error{}); });
+      return;
+    }
+    auto buf = std::make_shared<std::vector<char>>(read_size);
     peer_request r;
     r.piece = piece;
     r.start = 0;
-    r.length = piece_size;
+    r.length = read_size;
+    int const blocks2 = want_v2 ? se->fs->blocks_in_piece2(piece) : 0;
     async_read(idx, r,
-      [this, piece, buf, handler = std::move(handler), v2, want_v1 = bool(flags & disk_interface::v1_hash)]
+      [this, piece, buf, handler = std::move(handler), v2, want_v1, want_v2, piece_size, piece_size2, blocks2]
       (disk_buffer_holder holder, storage_error const& ec) mutable {
         if (ec) {
           handler(piece, sha1_hash{}, ec);
@@ -322,16 +404,17 @@ struct wasm_disk_io final
         sha1_hash sha1;
         if (want_v1) {
           hasher h;
-          h.update({buf->data(), static_cast<std::ptrdiff_t>(buf->size())});
+          h.update({buf->data(), static_cast<std::ptrdiff_t>(piece_size)});
           sha1 = h.final();
         }
 
-        constexpr int block = default_block_size;
-        int const n_blocks = static_cast<int>((buf->size() + block - 1) / block);
-        if (!v2.empty()) {
-          for (int b = 0; b < n_blocks && b < static_cast<int>(v2.size()); ++b) {
+        if (want_v2) {
+          constexpr int block = default_block_size;
+          for (int b = 0; b < blocks2 && b < static_cast<int>(v2.size()); ++b) {
             int const off = b * block;
-            int const sz = std::min<int>(block, static_cast<int>(buf->size()) - off);
+            // the LAST leaf of a file is hashed short, never zero filled out to a whole block
+            int const sz = std::min<int>(block, piece_size2 - off);
+            if (sz <= 0) break;
             hasher256 h2;
             h2.update({buf->data() + off, sz});
             v2[b] = h2.final();
@@ -354,8 +437,13 @@ struct wasm_disk_io final
       });
       return;
     }
-    int const piece_size = se->fs->piece_size(piece);
+    // piece_size2, not piece_size: a v2 block stops at the end of its file. See async_hash above.
+    int const piece_size = se->fs->piece_size2(piece);
     int const sz = std::min<int>(default_block_size, piece_size - offset);
+    if (sz <= 0) {
+      post(m_ios, [handler = std::move(handler), piece] { handler(piece, sha256_hash{}, storage_error{}); });
+      return;
+    }
     auto buf = std::make_shared<std::vector<char>>(sz);
     peer_request r;
     r.piece = piece;
