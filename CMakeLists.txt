@@ -66,6 +66,21 @@ set(LT_DEFS
   BOOST_ALL_NO_LIB
 )
 
+# ----- diagnostic build -----------------------------------------------------
+# libtorrent's own preconditions are compiled OUT of a release build, so a call
+# that violates one does not report anything: it reads past a vector and the
+# module dies with `memory access out of bounds`, which names nothing. Turning
+# these on trades size and speed for an assertion that says which invariant and
+# where. `emcmake cmake -S . -B cmake-out -DLT_ASSERTS=ON` then rebuild.
+option(LT_ASSERTS "Compile libtorrent's own assertions, for diagnosing a wasm fault" OFF)
+if (LT_ASSERTS)
+  list(APPEND LT_DEFS TORRENT_USE_ASSERTS=1)
+endif()
+
+# AddressSanitizer names the allocation and the overflow instead of leaving a bare
+# `memory access out of bounds`. Slow and memory hungry, so it is a switch, not a default.
+option(LT_ASAN "Build with AddressSanitizer, for naming a heap fault" OFF)
+
 # ----- target ---------------------------------------------------------------
 add_executable(libtorrent
   ${LT_SOURCES}
@@ -94,6 +109,10 @@ target_compile_options(libtorrent PRIVATE
   -O3 -fexceptions
   -Wno-deprecated-declarations
 )
+
+if (LT_ASAN)
+  target_compile_options(libtorrent PRIVATE -fsanitize=address -fno-omit-frame-pointer -g2)
+endif()
 
 # Diagnostic option - keep import names unmangled so
 # `WebAssembly.Module.imports()` is readable.
@@ -127,7 +146,7 @@ set(EM_LINK_FLAGS
   "-sMAXIMUM_MEMORY=2147483648"
 
   # Helpers used by library_fkn.js - make sure they survive dead-code elim.
-  "-sEXPORTED_FUNCTIONS=['_lt_set_log','_lt_set_utp_receive_buffer','_lt_set_dht','_lt_set_listen_port','_lt_session_create','_lt_session_set_rate_limits','_lt_session_destroy','_lt_session_tick','_lt_session_pump_alerts','_lt_alerts_size','_lt_alerts_data','_lt_alerts_clear','_lt_session_add_magnet','_lt_session_add_torrent_file','_lt_session_add_torrent_with_resume','_lt_session_remove_torrent','_lt_session_remove_torrent_ex','_lt_torrent_pause','_lt_torrent_resume','_lt_torrent_force_recheck','_lt_torrent_save_resume_data','_lt_torrent_status','_lt_torrent_post_status','_lt_torrent_post_peers','_lt_torrent_post_trackers','_lt_torrent_infohash','_lt_torrent_set_sequential','_lt_torrent_set_flags','_lt_torrent_force_reannounce','_lt_torrent_queue_position','_lt_torrent_set_upload_limit','_lt_torrent_set_download_limit','_lt_torrent_read_piece','_lt_torrent_set_piece_deadline','_lt_torrent_clear_piece_deadlines','_lt_torrent_reset_piece_deadline','_lt_torrent_prioritize_pieces','_lt_torrent_prioritize_piece_list','_lt_torrent_prioritize_files','_lt_torrent_set_file_priority','_lt_torrent_cancel_piece_requests','_lt_disk_complete_read','_lt_disk_complete_write','_lt_disk_complete_simple','_lt_disk_complete_status','_lt_disk_complete_move','_lt_disk_complete_delete','_lt_disk_complete_rename','_lt_dns_complete','_lt_diag_tick_count','_lt_diag_total_handlers','_lt_diag_open_tcp','_lt_diag_open_udp','_lt_diag_force_reopen','_lt_diag_listen_full','_lt_diag_parse_interfaces','_malloc','_free']"
+  "-sEXPORTED_FUNCTIONS=['_lt_set_log','_lt_set_utp_receive_buffer','_lt_set_dht','_lt_set_listen_port','_lt_session_create','_lt_session_set_rate_limits','_lt_session_destroy','_lt_session_tick','_lt_session_pump_alerts','_lt_alerts_size','_lt_alerts_data','_lt_alerts_clear','_lt_session_add_magnet','_lt_session_add_torrent_file','_lt_session_add_torrent_with_resume','_lt_session_remove_torrent','_lt_session_remove_torrent_ex','_lt_torrent_pause','_lt_torrent_resume','_lt_torrent_force_recheck','_lt_torrent_save_resume_data','_lt_torrent_status','_lt_torrent_post_status','_lt_torrent_post_peers','_lt_torrent_post_trackers','_lt_torrent_infohash','_lt_torrent_infohash_v2','_lt_torrent_set_sequential','_lt_torrent_set_flags','_lt_torrent_force_reannounce','_lt_torrent_queue_position','_lt_torrent_set_upload_limit','_lt_torrent_set_download_limit','_lt_torrent_read_piece','_lt_torrent_set_piece_deadline','_lt_torrent_clear_piece_deadlines','_lt_torrent_reset_piece_deadline','_lt_torrent_prioritize_pieces','_lt_torrent_prioritize_piece_list','_lt_torrent_prioritize_files','_lt_torrent_set_file_priority','_lt_torrent_cancel_piece_requests','_lt_disk_complete_read','_lt_disk_complete_write','_lt_disk_complete_simple','_lt_disk_complete_status','_lt_disk_complete_move','_lt_disk_complete_delete','_lt_disk_complete_rename','_lt_dns_complete','_lt_diag_tick_count','_lt_diag_total_handlers','_lt_diag_open_tcp','_lt_diag_open_udp','_lt_diag_force_reopen','_lt_diag_listen_full','_lt_diag_parse_interfaces','_malloc','_free']"
   "-sEXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP32','HEAPU32','HEAP16','HEAPU16','UTF8ToString','stringToNewUTF8','lengthBytesUTF8']"
 
   # Our JS library: socket syscalls + disk bridge.
@@ -138,6 +157,14 @@ set(EM_LINK_FLAGS
 
 if (DEBUG_NAMES)
   list(APPEND EM_LINK_FLAGS "-sASSERTIONS=1" "--minify=0")
+endif()
+
+if (LT_ASSERTS)
+  list(APPEND EM_LINK_FLAGS "-sASSERTIONS=2" "-g2")
+endif()
+
+if (LT_ASAN)
+  list(APPEND EM_LINK_FLAGS "-fsanitize=address" "-sINITIAL_MEMORY=536870912" "-sALLOW_MEMORY_GROWTH=1" "-g2")
 endif()
 
 string(REPLACE ";" " " EM_LINK_FLAGS_STR "${EM_LINK_FLAGS}")
