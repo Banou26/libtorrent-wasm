@@ -89,7 +89,7 @@ const verify = async (root, torrent) => {
       if (last && (last.progress >= 1 || last.error)) break
       await sleep(50)
     }
-    return { status: last, infohash: session.infohash(handle) }
+    return { status: last, infohash: session.infohash(handle), files: session.files(handle) }
   } finally {
     session.destroy?.()
   }
@@ -103,7 +103,7 @@ for (const item of MANIFEST) {
       t.after(() => fs.rmSync(root, { recursive: true, force: true }))
       layOut(root, entry)
 
-      const { status, infohash } = await verify(root, path.join(FIXTURES, `${item.case}.${kind}.torrent`))
+      const { status, infohash, files } = await verify(root, path.join(FIXTURES, `${item.case}.${kind}.torrent`))
       assert.ok(status, 'the engine never reported a status')
       assert.equal(status.error, '', `the engine errored: ${status.error}`)
       assert.equal(status.progress, 1, 'the engine did not verify the torrent to completion')
@@ -120,6 +120,23 @@ for (const item of MANIFEST) {
        * hash, a string naming no torrent, while writing 24 bytes past a 41-byte allocation.
        */
       assert.match(infohash, kind === 'hybrid' ? /^[0-9a-f]{40}$/ : /^[0-9a-f]{64}$/)
+
+      /*
+       * WHICH FILES ARE PADS, which only the engine can answer.
+       *
+       * A pad occupies an index, so it cannot be filtered out of this list without shifting every
+       * file after it. The caller therefore needs it present AND needs to know which it is, or the
+       * person's file list, their torrent's size, the copy into their folder and any archive all
+       * quietly include zeroes nobody asked for.
+       */
+      const pads = files.files.filter((f) => f.pad)
+      const real = files.files.filter((f) => !f.pad)
+      assert.equal(real.length, entry.files.length, 'the engine reported a different number of real files')
+      assert.equal(files.contentSize, wanted, 'contentSize counted the padding')
+      assert.equal(files.totalSize, wanted + pads.reduce((sum, f) => sum + f.size, 0))
+      // every pad libtorrent names sits under a `.pad` directory, and no real file here does
+      for (const pad of pads) assert.ok(pad.path.includes('.pad/'), `${pad.path} was flagged as a pad`)
+      for (const file of real) assert.ok(!file.path.includes('.pad/'), `${file.path} was not flagged as a pad`)
     })
   }
 }

@@ -84,17 +84,23 @@ const makeModule = () => {
   return mod
 }
 
-// matches emit_torrent_ready in src/wrapper.cpp
+// matches emit_torrent_ready in src/wrapper.cpp, FIELD FOR FIELD: the decoder reads a fixed
+// layout, so anything added there has to be added here or every test below fails at once
 const torrentReady = ({ handle = 1, pieceLength = 1024, files = [] }) => {
   const total = files.reduce((n, f) => n + f.size, 0)
   const numPieces = Math.ceil(total / pieceLength)
   const parts = []
   const u32 = (v) => { const b = new DataView(new ArrayBuffer(4)); b.setUint32(0, v, true); parts.push(new Uint8Array(b.buffer)) }
   const i64 = (v) => { const b = new DataView(new ArrayBuffer(8)); b.setBigInt64(0, BigInt(v), true); parts.push(new Uint8Array(b.buffer)) }
+  const u8 = (v) => parts.push(new Uint8Array([v]))
   u32(handle); u32(7); u32(pieceLength); u32(numPieces); i64(total); u32(files.length)
   let offset = 0
   for (const f of files) {
     i64(offset); i64(f.size)
+    // the pad flag, which this record has carried since v2 torrents landed. This encoder is the
+    // SECOND writer of the format and the one nothing rebuilds, so a field added to the C++ and the
+    // decoder alone leaves it a byte short and every test in this file dies on a garbage path length
+    u8(f.pad ? 1 : 0)
     const path = new TextEncoder().encode(f.path)
     u32(path.length); parts.push(path)
     offset += f.size

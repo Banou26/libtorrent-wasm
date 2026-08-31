@@ -172,6 +172,19 @@ bool emit_torrent_ready(std::uint32_t storage_index) {
   for (lt::file_index_t i{0}; i < lt::file_index_t{nf}; ++i) {
     i64(fs->file_offset(i));
     i64(fs->file_size(i));
+    /*
+     * IS THIS A PAD FILE, which is a thing only the engine can answer.
+     *
+     * A v2 or hybrid torrent carries zero-filled pad files that push each real file onto a piece
+     * boundary. They occupy an INDEX like any other file, so they cannot be filtered out of this
+     * list without shifting every index after them and serving one file's bytes for another. The
+     * caller needs them present and needs to know which they are: a pad is not the person's data,
+     * so it belongs in no file list, no size total, no mirror to their folder and no zip.
+     *
+     * Sent as a flag rather than left to the caller to infer from the `.pad/<size>` path libtorrent
+     * happens to write, because `pad_file_at` is the actual answer and a name is a guess.
+     */
+    p.push_back(fs->pad_file_at(i) ? 1 : 0);
     std::string const path = fs->file_path(i);
     u32(static_cast<std::uint32_t>(path.size()));
     p.insert(p.end(), path.begin(), path.end());

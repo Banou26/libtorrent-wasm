@@ -159,16 +159,32 @@ export interface TorrentStatus {
 export interface FileEntry {
   path: string
   size: number
-  // absolute byte offset of this file within the concatenated torrent payload, not an offset inside the file
   /** absolute byte offset of this file within the concatenated torrent payload */
   offset: number
+  /**
+   * A PAD FILE: zeroes a v2 or hybrid torrent inserts to push the next file onto a piece boundary.
+   *
+   * Present in this list, and it has to be: reads are served by INDEX, so dropping one here would
+   * shift every file after it. It is not the person's data though, so it belongs in no file list
+   * they see, no size total, no copy into their folder and no archive. Skip it, do not filter it.
+   */
+  pad: boolean
 }
 
 export interface TorrentFiles {
   storageIndex: number
   pieceLength: number
   numPieces: number
+  /** Every byte the pieces cover, PADS INCLUDED. This is the geometry, not the content. */
   totalSize: number
+  /**
+   * What the person's own files add up to, pads excluded. The same as `totalSize` for a v1 torrent.
+   *
+   * Computed here rather than left to each caller, because a caller that summed `files` itself would
+   * be right until the first hybrid torrent and then quietly report a size nobody recognises: the
+   * padding on a pack of small files is easily a tenth of it.
+   */
+  contentSize: number
   files: FileEntry[]
 }
 
@@ -1347,11 +1363,13 @@ export class Session {
     for (let i = 0; i < numFiles; i++) {
       const offset = Number(view.getBigInt64(off, true)); off += 8
       const size = Number(view.getBigInt64(off, true)); off += 8
+      const pad = view.getUint8(off) === 1; off += 1
       const pathLen = view.getUint32(off, true); off += 4
       const path = dec.decode(new Uint8Array(view.buffer, view.byteOffset + off, pathLen)); off += pathLen
-      files.push({ path, size, offset })
+      files.push({ path, size, offset, pad })
     }
-    this.filesByHandle.set(handle, { storageIndex, pieceLength, numPieces, totalSize, files })
+    const contentSize = files.reduce((sum, file) => sum + (file.pad ? 0 : file.size), 0)
+    this.filesByHandle.set(handle, { storageIndex, pieceLength, numPieces, totalSize, contentSize, files })
   }
 
   private decodeStateUpdate(view: DataView, off: number) {
