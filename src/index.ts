@@ -474,6 +474,29 @@ export interface StreamWindowOptions {
   unclaimedPriority?: number
   /** Also set the torrent's sequential_download flag. Default true. */
   sequential?: boolean
+  /**
+   * Give the window pieces deadlines. Default true, which is what playback wants and what a BULK
+   * TRANSFER must not have.
+   *
+   * A deadline opts the piece into libtorrent's time-critical machinery, whose whole job is to beat
+   * the clock by asking several peers for the same block and taking whichever answers first
+   * (`request_time_critical_pieces`). Every copy that loses that race is counted redundant and
+   * thrown away. For a player that is a good trade: a duplicated block costs bandwidth and buys a
+   * frame that arrives on time. For a save to disk there is no frame and no clock, so it is pure
+   * waste, and on a metered relay the user pays for it twice.
+   *
+   * MEASURED 2026-09-02 on a 1446 MB single-file torrent over the FKN relay, driving Ripple's
+   * download page, which reads the file in 8 MiB chunks and re-anchors the window on each:
+   *
+   *   deadlines on  (shipped)   2325 MB fetched, 879 MB wasted, 1.617x the payload
+   *   read deadlines off        1594 MB fetched, 148 MB wasted, 1.102x
+   *   both off                  1454 MB fetched,   8 MB wasted, 1.011x
+   *
+   * 1.011x is exactly what the same torrent costs added to the library with no window at all, so
+   * turning deadlines off costs the export nothing and removes the entire overhead. Pair it with
+   * `deadlineMs: null` on the reads that drive it; either alone leaves most or some of the waste.
+   */
+  deadlines?: boolean
 }
 
 export interface ReadOptions {
@@ -805,7 +828,11 @@ export class Session {
     // the default, so the map has to be written after the clear and the ladder after the map.
     this.mod._lt_torrent_clear_piece_deadlines(handle)
     this.prioritizePieces(handle, prios)
-    for (const [piece, ms] of ladder) this.mod._lt_torrent_set_piece_deadline(handle, piece, ms, 0)
+    // the ladder is the streaming half of this call, and a bulk transfer wants only the priorities:
+    // see `deadlines` for what a deadline costs when nothing is waiting on a clock
+    if (opts.deadlines !== false) {
+      for (const [piece, ms] of ladder) this.mod._lt_torrent_set_piece_deadline(handle, piece, ms, 0)
+    }
     // the clear above took the in-flight reads' deadlines with it
     this.reissueReadDeadlines(handle)
     if (opts.sequential !== false) this.setSequential(handle, true)
